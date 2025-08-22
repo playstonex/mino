@@ -1,6 +1,6 @@
 module github.com/metacubex/mihomo
 
-go 1.20
+go 1.24.0
 
 require (
 	github.com/bahlo/generic-list-go v0.2.0
@@ -52,11 +52,11 @@ require (
 	gitlab.com/go-extension/aes-ccm v0.0.0-20230221065045-e58665ef23c7
 	go.uber.org/automaxprocs v1.6.0
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
-	golang.org/x/crypto v0.33.0 // lastest version compatible with golang1.20
+	golang.org/x/crypto v0.41.0 // lastest version compatible with golang1.20
 	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e // lastest version compatible with golang1.20
-	golang.org/x/net v0.35.0 // lastest version compatible with golang1.20
-	golang.org/x/sync v0.11.0 // lastest version compatible with golang1.20
-	golang.org/x/sys v0.30.0 // lastest version compatible with golang1.20
+	golang.org/x/net v0.43.0 // lastest version compatible with golang1.20
+	golang.org/x/sync v0.16.0 // lastest version compatible with golang1.20
+	golang.org/x/sys v0.35.0 // lastest version compatible with golang1.20
 	google.golang.org/protobuf v1.34.2 // lastest version compatible with golang1.20
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -108,8 +108,9 @@ require (
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	gitlab.com/yawning/bsaes.git v0.0.0-20190805113838-0a714cd429ec // indirect
 	go.uber.org/mock v0.4.0 // indirect
-	golang.org/x/mod v0.20.0 // indirect
-	golang.org/x/text v0.22.0 // indirect
+	golang.org/x/mobile v0.0.0-20250813145510-f12310a0cfd9 // indirect
+	golang.org/x/mod v0.27.0 // indirect
+	golang.org/x/text v0.28.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
-	golang.org/x/tools v0.24.0 // indirect
+	golang.org/x/tools v0.36.0 // indirect
 )
