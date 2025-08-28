@@ -25,6 +25,10 @@ func init() {
 	})
 }
 
+func SetLogOutputFile(file *os.File) {
+	log.SetOutput(file)
+}
+
 type Event struct {
 	LogLevel LogLevel
 	Payload  string

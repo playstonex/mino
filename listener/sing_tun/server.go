@@ -69,7 +69,7 @@ type Listener struct {
 var emptyAddressSet = []*netipx.IPSet{{}}
 
 func CalculateInterfaceName(name string) (tunName string) {
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
 		tunName = "utun"
 	} else if name != "" {
 		tunName = name
@@ -110,7 +110,7 @@ func checkTunName(tunName string) (ok bool) {
 			log.Warnln("[TUN] Unsupported tunName(%s) in %s, force regenerate by ourselves.", tunName, runtime.GOOS)
 		}
 	}()
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "ios" {
 		if len(tunName) <= 4 {
 			return false
 		}
@@ -303,7 +303,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		if disable, _ := strconv.ParseBool(os.Getenv("DISABLE_OVERRIDE_ANDROID_VPN")); disable {
 			overrideAndroidVPN = false
 		}
-		defaultInterfaceMonitor, err = tun.NewDefaultInterfaceMonitor(networkUpdateMonitor, log.SingLogger, tun.DefaultInterfaceMonitorOptions{InterfaceFinder: interfaceFinder, OverrideAndroidVPN: overrideAndroidVPN})
+		defaultInterfaceMonitor, err = tun.NewDefaultInterfaceMonitor(networkUpdateMonitor, log.SingLogger, tun.DefaultInterfaceMonitorOptions{InterfaceFinder: interfaceFinder, OverrideAndroidVPN: overrideAndroidVPN, UnderNetworkExtension: true})
 		if err != nil {
 			err = E.Cause(err, "create DefaultInterfaceMonitor")
 			return

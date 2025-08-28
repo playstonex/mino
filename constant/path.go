@@ -10,6 +10,7 @@ import (
 
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/constant/features"
+	"github.com/metacubex/mihomo/log"
 )
 
 const Name = "mihomo"
@@ -55,6 +56,9 @@ type path struct {
 	configFile      string
 	allowUnsafePath bool
 	safePaths       []string
+	logDir          string
+	cacheDir        string
+	errorDir        string
 }
 
 // SetHomeDir is used to set the configuration path
@@ -219,4 +223,51 @@ func (p *path) GetExecutableFullPath() string {
 	}
 	res, _ := filepath.EvalSymlinks(exePath)
 	return res
+}
+
+func (p *path) LogDir() string {
+	if p.logDir != "" {
+		return p.Resolve(p.logDir)
+	}
+	return P.Join(p.homeDir, "logs")
+}
+func (p *path) SetLogDir(dir string) {
+	p.logDir = dir
+
+	path := P.Join(p.LogDir(), "out.log")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	log.SetLogOutputFile(f)
+
+}
+
+func (p *path) CacheDir() string {
+	if p.cacheDir != "" {
+		return p.Resolve(p.cacheDir)
+	}
+	return P.Join(p.homeDir, "cache")
+}
+
+func (p *path) LogFile() *os.File {
+	path := P.Join(p.LogDir(), "out.log")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return os.Stderr
+	}
+	return f
+}
+
+func (p *path) SetCacheDir(dir string) {
+	p.cacheDir = dir
+}
+func (p *path) ErrorDir() string {
+	if p.errorDir != "" {
+		return p.Resolve(p.errorDir)
+	}
+	return P.Join(p.homeDir, "errors")
+}
+func (p *path) SetErrorDir(dir string) {
+	p.errorDir = dir
 }
