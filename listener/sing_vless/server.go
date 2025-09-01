@@ -46,15 +46,7 @@ func init() {
 	})
 
 	vless.RegisterTLS(func(conn net.Conn) (loaded bool, netConn net.Conn, reflectType reflect.Type, reflectPointer unsafe.Pointer) {
-		tlsConn, loaded := network.CastReader[*encryption.ClientConn](conn)
-		if !loaded {
-			return
-		}
-		return true, tlsConn.Conn, reflect.TypeOf(tlsConn).Elem(), unsafe.Pointer(tlsConn)
-	})
-
-	vless.RegisterTLS(func(conn net.Conn) (loaded bool, netConn net.Conn, reflectType reflect.Type, reflectPointer unsafe.Pointer) {
-		tlsConn, loaded := network.CastReader[*encryption.ServerConn](conn)
+		tlsConn, loaded := network.CastReader[*encryption.CommonConn](conn)
 		if !loaded {
 			return
 		}
@@ -238,7 +230,7 @@ func (l *Listener) HandleConn(conn net.Conn, tunnel C.Tunnel, additions ...inbou
 	ctx := sing.WithAdditions(context.TODO(), additions...)
 	if l.decryption != nil {
 		var err error
-		conn, err = l.decryption.Handshake(conn)
+		conn, err = l.decryption.Handshake(conn, nil)
 		if err != nil {
 			return
 		}
