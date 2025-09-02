@@ -125,7 +125,7 @@ func checkTunName(tunName string) (ok bool) {
 	return true
 }
 
-func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Listener, err error) {
+func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, additions ...inbound.Addition) (l *Listener, err error) {
 	if len(additions) == 0 {
 		additions = []inbound.Addition{
 			inbound.WithInName("DEFAULT-TUN"),
@@ -425,7 +425,14 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		err = E.Cause(err, "build android rules")
 		return
 	}
-	tunIf, err := tunNew(tunOptions)
+	var tunIf tun.Tun
+	var tunRrr error
+	if creator != nil {
+		tunIf, tunRrr = creator.OpenTun(&tunOptions)
+	}
+	if tunRrr != nil || tunIf == nil {
+		tunIf, err = tunNew(tunOptions)
+	}
 	if err != nil {
 		err = E.Cause(err, "configure tun interface")
 		return

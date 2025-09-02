@@ -148,7 +148,7 @@ func (t *Tun) Address() string {
 // Listen implements constant.InboundListener
 func (t *Tun) Listen(tunnel C.Tunnel) error {
 	var err error
-	t.l, err = sing_tun.New(t.tun, tunnel, t.Additions()...)
+	t.l, err = sing_tun.New(t.tun, tunnel, C.GetTunOutterCreator(), t.Additions()...)
 	if err != nil {
 		return err
 	}

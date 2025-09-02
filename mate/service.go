@@ -67,6 +67,10 @@ func SetLogDir(logDir string) {
 	C.Path.SetLogDir(logDir)
 }
 
+func SetTunCreator(acreator C.TunListenOutterCreator) {
+	C.SetOutterCreator(acreator)
+}
+
 type platformInterfaceWrapper struct {
 	iif       PlatformInterface
 	useProcFS bool
@@ -133,6 +137,3 @@ func (w *platformInterfaceWrapper) DisableColors() bool {
 func (w *platformInterfaceWrapper) WriteMessage(level log.LogLevel, message string) {
 	w.iif.WriteLog(message)
 }
-
-
-

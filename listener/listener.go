@@ -524,7 +524,7 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
 		return
 	}
 
-	lister, err := sing_tun.New(tunConf, tunnel)
+	lister, err := sing_tun.New(tunConf, tunnel, C.GetTunOutterCreator())
 	if err != nil {
 		return
 	}

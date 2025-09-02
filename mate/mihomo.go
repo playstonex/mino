@@ -47,7 +47,7 @@ func Start(config *ServerConfig, platformInterface PlatformInterface) error {
 	if err != nil {
 		return err
 	}
-
+	SetTunCreator(globalService.plantformWrapper)
 	return globalService.Start()
 }
 
