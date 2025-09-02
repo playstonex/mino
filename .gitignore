@@ -6,7 +6,7 @@
 *.dylib
 bin/*
 mihomo/*
-
+mate.xcframework/*
 # Test binary, build with `go test -c`
 *.test
 
