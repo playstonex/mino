@@ -48,6 +48,7 @@ func Warnln(format string, v ...any) {
 	event := newLog(WARNING, format, v...)
 	logCh <- event
 	print(event)
+
 }
 
 func Errorln(format string, v ...any) {
