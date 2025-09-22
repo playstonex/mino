@@ -267,8 +267,9 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 	}
 
 	handler := &ListenerHandler{
-		ListenerHandler: h,
-		DnsAdds:         dnsAdds,
+		ListenerHandler:       h,
+		DnsAdds:               dnsAdds,
+		DisableICMPForwarding: options.DisableICMPForwarding,
 	}
 	l = &Listener{
 		closed:  false,
