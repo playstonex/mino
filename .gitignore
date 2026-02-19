@@ -26,4 +26,5 @@ vendor
 test/config/cache*
 /output
 .vscode/
-.fleet/
+.fleet/build/
+.claude/
