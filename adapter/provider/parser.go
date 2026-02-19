@@ -1,7 +1,6 @@
 package provider
 
 import (
-	"encoding"
 	"errors"
 	"fmt"
 	"time"
@@ -10,9 +9,7 @@ import (
 	"github.com/metacubex/mihomo/common/utils"
 	"github.com/metacubex/mihomo/component/resource"
 	C "github.com/metacubex/mihomo/constant"
-	types "github.com/metacubex/mihomo/constant/provider"
-
-	"github.com/dlclark/regexp2"
+	P "github.com/metacubex/mihomo/constant/provider"
 )
 
 var (
@@ -26,33 +23,6 @@ type healthCheckSchema struct {
 	TestTimeout    int    `provider:"timeout,omitempty"`
 	Lazy           bool   `provider:"lazy,omitempty"`
 	ExpectedStatus string `provider:"expected-status,omitempty"`
-}
-
-type OverrideProxyNameSchema struct {
-	// matching expression for regex replacement
-	Pattern *regexp2.Regexp `provider:"pattern"`
-	// the new content after regex matching
-	Target string `provider:"target"`
-}
-
-var _ encoding.TextUnmarshaler = (*regexp2.Regexp)(nil) // ensure *regexp2.Regexp can decode direct by structure package
-
-type OverrideSchema struct {
-	TFO              *bool   `provider:"tfo,omitempty"`
-	MPTcp            *bool   `provider:"mptcp,omitempty"`
-	UDP              *bool   `provider:"udp,omitempty"`
-	UDPOverTCP       *bool   `provider:"udp-over-tcp,omitempty"`
-	Up               *string `provider:"up,omitempty"`
-	Down             *string `provider:"down,omitempty"`
-	DialerProxy      *string `provider:"dialer-proxy,omitempty"`
-	SkipCertVerify   *bool   `provider:"skip-cert-verify,omitempty"`
-	Interface        *string `provider:"interface-name,omitempty"`
-	RoutingMark      *int    `provider:"routing-mark,omitempty"`
-	IPVersion        *string `provider:"ip-version,omitempty"`
-	AdditionalPrefix *string `provider:"additional-prefix,omitempty"`
-	AdditionalSuffix *string `provider:"additional-suffix,omitempty"`
-
-	ProxyName []OverrideProxyNameSchema `provider:"proxy-name,omitempty"`
 }
 
 type proxyProviderSchema struct {
@@ -69,11 +39,11 @@ type proxyProviderSchema struct {
 	Payload       []map[string]any `provider:"payload,omitempty"`
 
 	HealthCheck healthCheckSchema   `provider:"health-check,omitempty"`
-	Override    OverrideSchema      `provider:"override,omitempty"`
+	Override    overrideSchema      `provider:"override,omitempty"`
 	Header      map[string][]string `provider:"header,omitempty"`
 }
 
-func ParseProxyProvider(name string, mapping map[string]any) (types.ProxyProvider, error) {
+func ParseProxyProvider(name string, mapping map[string]any) (P.ProxyProvider, error) {
 	decoder := structure.NewDecoder(structure.Option{TagName: "provider", WeaklyTypedInput: true})
 
 	schema := &proxyProviderSchema{
@@ -99,12 +69,12 @@ func ParseProxyProvider(name string, mapping map[string]any) (types.ProxyProvide
 	}
 	hc := NewHealthCheck([]C.Proxy{}, schema.HealthCheck.URL, uint(schema.HealthCheck.TestTimeout), hcInterval, schema.HealthCheck.Lazy, expectedStatus)
 
-	parser, err := NewProxiesParser(schema.Filter, schema.ExcludeFilter, schema.ExcludeType, schema.DialerProxy, schema.Override)
+	parser, err := NewProxiesParser(name, schema.Filter, schema.ExcludeFilter, schema.ExcludeType, schema.DialerProxy, schema.Override)
 	if err != nil {
 		return nil, err
 	}
 
-	var vehicle types.Vehicle
+	var vehicle P.Vehicle
 	switch schema.Type {
 	case "file":
 		path := C.Path.Resolve(schema.Path)

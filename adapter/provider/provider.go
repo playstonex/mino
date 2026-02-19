@@ -4,23 +4,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/common/convert"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/common/yaml"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/component/resource"
 	C "github.com/metacubex/mihomo/constant"
-	types "github.com/metacubex/mihomo/constant/provider"
+	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 
 	"github.com/dlclark/regexp2"
-	"gopkg.in/yaml.v3"
+	"github.com/metacubex/http"
 )
 
 const (
@@ -43,6 +43,7 @@ type providerForApi struct {
 }
 
 type baseProvider struct {
+	mutex       sync.RWMutex
 	name        string
 	proxies     []C.Proxy
 	healthCheck *HealthCheck
@@ -54,6 +55,8 @@ func (bp *baseProvider) Name() string {
 }
 
 func (bp *baseProvider) Version() uint32 {
+	bp.mutex.RLock()
+	defer bp.mutex.RUnlock()
 	return bp.version
 }
 
@@ -68,15 +71,19 @@ func (bp *baseProvider) HealthCheck() {
 	bp.healthCheck.check()
 }
 
-func (bp *baseProvider) Type() types.ProviderType {
-	return types.Proxy
+func (bp *baseProvider) Type() P.ProviderType {
+	return P.Proxy
 }
 
 func (bp *baseProvider) Proxies() []C.Proxy {
+	bp.mutex.RLock()
+	defer bp.mutex.RUnlock()
 	return bp.proxies
 }
 
 func (bp *baseProvider) Count() int {
+	bp.mutex.RLock()
+	defer bp.mutex.RUnlock()
 	return len(bp.proxies)
 }
 
@@ -93,6 +100,8 @@ func (bp *baseProvider) RegisterHealthCheckTask(url string, expectedStatus utils
 }
 
 func (bp *baseProvider) setProxies(proxies []C.Proxy) {
+	bp.mutex.Lock()
+	defer bp.mutex.Unlock()
 	bp.proxies = proxies
 	bp.version += 1
 	bp.healthCheck.setProxies(proxies)
@@ -156,7 +165,7 @@ func (pp *proxySetProvider) Initial() error {
 
 func (pp *proxySetProvider) closeAllConnections() {
 	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
-		for _, chain := range c.Chains() {
+		for _, chain := range c.ProviderChains() {
 			if chain == pp.Name() {
 				_ = c.Close()
 				break
@@ -171,7 +180,7 @@ func (pp *proxySetProvider) Close() error {
 	return pp.Fetcher.Close()
 }
 
-func NewProxySetProvider(name string, interval time.Duration, payload []map[string]any, parser resource.Parser[[]C.Proxy], vehicle types.Vehicle, hc *HealthCheck) (*ProxySetProvider, error) {
+func NewProxySetProvider(name string, interval time.Duration, payload []map[string]any, parser resource.Parser[[]C.Proxy], vehicle P.Vehicle, hc *HealthCheck) (*ProxySetProvider, error) {
 	pd := &proxySetProvider{
 		baseProvider: baseProvider{
 			name:        name,
@@ -238,8 +247,8 @@ func (ip *inlineProvider) MarshalJSON() ([]byte, error) {
 	})
 }
 
-func (ip *inlineProvider) VehicleType() types.VehicleType {
-	return types.Inline
+func (ip *inlineProvider) VehicleType() P.VehicleType {
+	return P.Inline
 }
 
 func (ip *inlineProvider) Update() error {
@@ -303,8 +312,8 @@ func (cp *compatibleProvider) Update() error {
 	return nil
 }
 
-func (cp *compatibleProvider) VehicleType() types.VehicleType {
-	return types.Compatible
+func (cp *compatibleProvider) VehicleType() P.VehicleType {
+	return P.Compatible
 }
 
 func NewCompatibleProvider(name string, proxies []C.Proxy, hc *HealthCheck) (*CompatibleProvider, error) {
@@ -330,7 +339,7 @@ func (cp *CompatibleProvider) Close() error {
 	return cp.compatibleProvider.Close()
 }
 
-func NewProxiesParser(filter string, excludeFilter string, excludeType string, dialerProxy string, override OverrideSchema) (resource.Parser[[]C.Proxy], error) {
+func NewProxiesParser(pdName string, filter string, excludeFilter string, excludeType string, dialerProxy string, override overrideSchema) (resource.Parser[[]C.Proxy], error) {
 	var excludeTypeArray []string
 	if excludeType != "" {
 		excludeTypeArray = strings.Split(excludeType, "|")
@@ -419,36 +428,12 @@ func NewProxiesParser(filter string, excludeFilter string, excludeType string, d
 					mapping["dialer-proxy"] = dialerProxy
 				}
 
-				val := reflect.ValueOf(override)
-				for i := 0; i < val.NumField(); i++ {
-					field := val.Field(i)
-					if field.IsNil() {
-						continue
-					}
-					fieldName := strings.Split(val.Type().Field(i).Tag.Get("provider"), ",")[0]
-					switch fieldName {
-					case "additional-prefix":
-						name := mapping["name"].(string)
-						mapping["name"] = *field.Interface().(*string) + name
-					case "additional-suffix":
-						name := mapping["name"].(string)
-						mapping["name"] = name + *field.Interface().(*string)
-					case "proxy-name":
-						// Iterate through all naming replacement rules and perform the replacements.
-						for _, expr := range override.ProxyName {
-							name := mapping["name"].(string)
-							newName, err := expr.Pattern.Replace(name, expr.Target, 0, -1)
-							if err != nil {
-								return nil, fmt.Errorf("proxy name replace error: %w", err)
-							}
-							mapping["name"] = newName
-						}
-					default:
-						mapping[fieldName] = field.Elem().Interface()
-					}
+				err := override.Apply(mapping)
+				if err != nil {
+					return nil, fmt.Errorf("proxy %d override error: %w", idx, err)
 				}
 
-				proxy, err := adapter.ParseProxy(mapping)
+				proxy, err := adapter.ParseProxy(mapping, adapter.WithProviderName(pdName))
 				if err != nil {
 					return nil, fmt.Errorf("proxy %d error: %w", idx, err)
 				}

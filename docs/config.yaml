@@ -97,11 +97,6 @@ external-doh-server: /dns-query
 
 # interface-name: en0 # 设置出口网卡
 
-# 全局 TLS 指纹，优先低于 proxy 内的 client-fingerprint
-# 可选： "chrome","firefox","safari","ios","random","none" options.
-# Utls is currently support TLS transport in TCP/grpc/WS/HTTP for VLESS/Vmess and trojan.
-global-client-fingerprint: chrome
-
 #  TCP keep alive interval
 # disable-keep-alive: false #目前在android端强制为true
 # keep-alive-idle: 15
@@ -261,6 +256,7 @@ dns:
   enhanced-mode: fake-ip # or redir-host
 
   fake-ip-range: 198.18.0.1/16 # fake-ip 池设置
+  # fake-ip-range6: fdfe:dcba:9876::1/64 # fake-ip6 池设置
 
   # 配置不使用 fake-ip 的域名
   fake-ip-filter:
@@ -271,9 +267,23 @@ dns:
     - rule-set:fakeip-filter
     # fakeip-filter 为 geosite 中名为 fakeip-filter 的分类（需要自行保证该分类存在）
     - geosite:fakeip-filter
+
+    # 当 fake-ip-filter-mode: rule 时开启规则模式
+    # fake-ip 与路由 rules 匹配逻辑一致(自上而下)，语法也一致，支持GEOSITE、RuleSet、DOMAIN*、MATCH
+    - RULE-SET,reject-domain,fake-ip # 自定义 RuleSet behavior 必须为 domain/classical，当为 classical 时仅会生效域名类规则
+    - RULE-SET,proxy-domain,fake-ip
+    - GEOSITE,gfw,fake-ip
+    - DOMAIN,www.baidu.com,real-ip
+    - DOMAIN-SUFFIX,qq.com,real-ip
+    - DOMAIN-SUFFIX,jd.com,fake-ip
+    - MATCH,fake-ip # 最后 fake-ip or real-ip
+
   # 配置fake-ip-filter的匹配模式，默认为blacklist，即如果匹配成功不返回fake-ip
   # 可设置为whitelist，即只有匹配成功才返回fake-ip
+  # 也可配置为rule，规则模式语法见fake-ip-filter说明
   fake-ip-filter-mode: blacklist
+  # 配置fakeip查询返回的TTL，非必要情况下请勿修改
+  fake-ip-ttl: 1
 
   # use-hosts: true # 查询 hosts
 
@@ -308,8 +318,10 @@ dns:
 
   # 专用于节点域名解析的 DNS 服务器，非必要配置项，如果不填则遵循nameserver-policy、nameserver和fallback的配置
   # proxy-server-nameserver:
-  #   - https://dns.google/dns-query
-  #   - tls://one.one.one.one
+  #   - https://doh.pub/dns-query
+  #   - tls://223.5.5.5:853
+  # proxy-server-nameserver-policy: # 格式同nameserver-policy，仅用于节点域名解析，当且仅当proxy-server-nameserver不为空时生效
+  #   'www.yournode.com': '114.114.114.114'
 
   # 专用于direct出口域名解析的 DNS 服务器，非必要配置项，如果不填则遵循nameserver-policy、nameserver和fallback的配置
   # direct-nameserver:
@@ -449,6 +461,7 @@ proxies: # socks5
       #   enable: true # 必须手动开启
       #   # 如果config为空则通过dns解析，不为空则通过该值指定，格式为经过base64编码的ech参数（dig +short TYPE65 tls-ech.dev）
       #   config: AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA
+      #   # query-server-name: xxx.com # 可选项，不为空时用于指定通过dns解析时的域名
       # skip-cert-verify: true
       # host: bing.com
       # path: "/"
@@ -534,6 +547,39 @@ proxies: # socks5
       version-hint: "tls12"
       restls-script: "1000?100<1,500~100,350~100,600~100,400~200"
 
+  - name: "ss-kcptun"
+    type: ss
+    server: [YOUR_SERVER_IP]
+    port: 443
+    cipher: chacha20-ietf-poly1305
+    password: [YOUR_SS_PASSWORD]
+    plugin: kcptun
+    plugin-opts:
+      key: it's a secrect # pre-shared secret between client and server
+      crypt: aes # aes, aes-128, aes-128-gcm, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, none, null
+      mode: fast # profiles: fast3, fast2, fast, normal, manual
+      conn: 1 # set num of UDP connections to server
+      autoexpire: 0 # set auto expiration time(in seconds) for a single UDP connection, 0 to disable
+      scavengettl: 600 # set how long an expired connection can live (in seconds)
+      mtu: 1350 # set maximum transmission unit for UDP packets
+      ratelimit: 0 # set maximum outgoing speed (in bytes per second) for a single KCP connection, 0 to disable. Also known as packet pacing
+      sndwnd: 128 # set send window size(num of packets)
+      rcvwnd: 512 # set receive window size(num of packets)
+      datashard: 10 # set reed-solomon erasure coding - datashard
+      parityshard: 3 # set reed-solomon erasure coding - parityshard
+      dscp: 0 # set DSCP(6bit)
+      nocomp: false # disable compression
+      acknodelay: false # flush ack immediately when a packet is received
+      nodelay: 0
+      interval: 50
+      resend: 0
+      sockbuf: 4194304 # per-socket buffer in bytes
+      smuxver: 1 # specify smux version, available 1,2
+      smuxbuf: 4194304 # the overall de-mux buffer in bytes
+      framesize: 8192 # smux max frame size
+      streambuf: 2097152 # per stream receive buffer in bytes, smux v2+
+      keepalive: 10 # seconds between heartbeats
+
   # vmess
   # cipher 支持 auto/aes-128-gcm/chacha20-poly1305/none
   - name: "vmess"
@@ -557,6 +603,7 @@ proxies: # socks5
     #   enable: true # 必须手动开启
     #   # 如果config为空则通过dns解析，不为空则通过该值指定，格式为经过base64编码的ech参数（dig +short TYPE65 tls-ech.dev）
     #   config: AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA
+    #   # query-server-name: xxx.com # 可选项，不为空时用于指定通过dns解析时的域名
     # ws-opts:
       # path: /path
       # headers:
@@ -621,6 +668,7 @@ proxies: # socks5
     # skip-cert-verify: true
     grpc-opts:
       grpc-service-name: "example"
+      # grpc-user-agent: "grpc-go/1.36.0"
     # ip-version: ipv4
 
   # vless
@@ -641,6 +689,7 @@ proxies: # socks5
     #   enable: true # 必须手动开启
     #   # 如果config为空则通过dns解析，不为空则通过该值指定，格式为经过base64编码的ech参数（dig +short TYPE65 tls-ech.dev）
     #   config: AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA
+    #   # query-server-name: xxx.com # 可选项，不为空时用于指定通过dns解析时的域名
 
   - name: "vless-vision"
     type: vless
@@ -709,6 +758,8 @@ proxies: # socks5
     servername: testingcf.jsdelivr.net
     grpc-opts:
       grpc-service-name: "grpc"
+      # grpc-user-agent: "grpc-go/1.36.0"
+      
     reality-opts:
       public-key: CrrQSjAG_YkHLwvM2M-7XkKJilgL5upBKCp0od0tLhE
       short-id: 10f897e26c4b9478
@@ -761,6 +812,7 @@ proxies: # socks5
     #   enable: true # 必须手动开启
     #   # 如果config为空则通过dns解析，不为空则通过该值指定，格式为经过base64编码的ech参数（dig +short TYPE65 tls-ech.dev）
     #   config: AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA
+    #   # query-server-name: xxx.com # 可选项，不为空时用于指定通过dns解析时的域名
 
   - name: trojan-grpc
     server: server
@@ -777,6 +829,7 @@ proxies: # socks5
     udp: true
     grpc-opts:
       grpc-service-name: "example"
+      # grpc-user-agent: "grpc-go/1.36.0"
 
   - name: trojan-ws
     server: server
@@ -831,6 +884,7 @@ proxies: # socks5
     #   enable: true # 必须手动开启
     #   # 如果config为空则通过dns解析，不为空则通过该值指定，格式为经过base64编码的ech参数（dig +short TYPE65 tls-ech.dev）
     #   config: AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA
+    #   # query-server-name: xxx.com # 可选项，不为空时用于指定通过dns解析时的域名
     # skip-cert-verify: false
     # recv-window-conn: 12582912
     # recv-window: 52428800
@@ -859,6 +913,7 @@ proxies: # socks5
     #   enable: true # 必须手动开启
     #   # 如果config为空则通过dns解析，不为空则通过该值指定，格式为经过base64编码的ech参数（dig +short TYPE65 tls-ech.dev）
     #   config: AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA
+    #   # query-server-name: xxx.com # 可选项，不为空时用于指定通过dns解析时的域名
     # skip-cert-verify: false
     # fingerprint: xxxx # 配置指纹将实现 SSL Pining 效果, 可使用 openssl x509 -noout -fingerprint -sha256 -inform pem -in yourcert.pem 获取
     # 下面两项如果填写则开启 mTLS（需要同时填写）
@@ -886,6 +941,7 @@ proxies: # socks5
     reserved: "U4An"
     # 数组格式也是合法的
     # reserved: [209,98,59]
+    # persistent-keepalive: 0
     # 一个出站代理的标识。当值不为空时，将使用指定的 proxy 发出连接
     # dialer-proxy: "ss1"
     # remote-dns-resolve: true # 强制 dns 远程解析，默认值为 false
@@ -926,6 +982,23 @@ proxies: # socks5
     #   j3: <t><b 0xf6ab><c><r 10>                        # AmneziaWG v1.5 only (removed in v2)
     #   itime: 60                                         # AmneziaWG v1.5 only (removed in v2)
 
+  # masque
+  - name: "masque"
+    type: masque
+    server: 162.159.198.1
+    port: 443
+    private-key: MHcCAQEEILI1eOtnbEIh89Fj4yNDuFR6UjayCKI3NdLl3DhetimWoAoGCCqGSM49AwEHoUQDQgAEgyXrE8v+hHsHy3ewSb3WcRjYgCrM9T9hiE0Uv6k2DZ1+4kefrDT9v1Q/8wdRigTf6t6gGNUV8W+IUMdrfUt+9g==
+    public-key: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==
+    ip: 172.16.0.2
+    ipv6: 2606:4700:110:84c0:163a:4914:a0ad:3342
+    mtu: 1280
+    udp: true
+    # 一个出站代理的标识。当值不为空时，将使用指定的 proxy 发出连接
+    # dialer-proxy: "ss1"
+    # remote-dns-resolve: true # 强制 dns 远程解析，默认值为 false
+    # dns: [ 1.1.1.1, 8.8.8.8 ] # 仅在 remote-dns-resolve 为 true 时生效
+    # congestion-controller: bbr # 默认不开启
+
   # tuic
   - name: tuic
     server: www.example.com
@@ -954,6 +1027,7 @@ proxies: # socks5
     #   enable: true # 必须手动开启
     #   # 如果config为空则通过dns解析，不为空则通过该值指定，格式为经过base64编码的ech参数（dig +short TYPE65 tls-ech.dev）
     #   config: AEn+DQBFKwAgACABWIHUGj4u+PIggYXcR5JF0gYk3dCRioBW8uJq9H4mKAAIAAEAAQABAANAEnB1YmxpYy50bHMtZWNoLmRldgAA
+    #   # query-server-name: xxx.com # 可选项，不为空时用于指定通过dns解析时的域名
     #
     # meta 和 sing-box 私有扩展，将 ss-uot 用于 udp 中继，开启此选项后 udp-relay-mode 将失效
     # 警告，与原版 tuic 不兼容！！！
@@ -995,7 +1069,7 @@ proxies: # socks5
     server: 1.2.3.4
     port: 2999
     # port-range: 2090-2099 #（不可同时填写 port 和 port-range）
-    transport: TCP # 只支持 TCP
+    transport: TCP # 支持 TCP 或者 UDP
     udp: true # 支持 UDP over TCP
     username: user
     password: password
@@ -1003,6 +1077,26 @@ proxies: # socks5
     # multiplexing: MULTIPLEXING_LOW
     # 如果想开启 0-RTT 握手，请设置为 HANDSHAKE_NO_WAIT，否则请设置为 HANDSHAKE_STANDARD。默认值为 HANDSHAKE_STANDARD
     # handshake-mode: HANDSHAKE_STANDARD
+
+  # sudoku
+  - name: sudoku
+    type: sudoku
+    server: server_ip/domain # 1.2.3.4 or domain
+    port: 443 
+    key: "<client_key>" # 如果你使用sudoku生成的ED25519密钥对，请填写密钥对中的私钥，否则填入和服务端相同的uuid
+    aead-method: chacha20-poly1305 # 可选：chacha20-poly1305、aes-128-gcm、none（不建议；且 enable-pure-downlink=false 时不可用）
+    padding-min: 2 # 最小填充率（0-100）
+    padding-max: 7 # 最大填充率（0-100，必须 >= padding-min）
+    table-type: prefer_ascii    # 可选值：prefer_ascii、prefer_entropy 前者全ascii映射，后者保证熵值（汉明1）低于3
+    # custom-table: xpxvvpvv    # 可选，自定义字节布局，必须包含2个x、2个p、4个v，可随意组合。启用此处则需配置`table-type`为`prefer_entropy`
+    # custom-tables: ["xpxvvpvv", "vxpvxvvp"] # 可选，自定义字节布局列表（x/v/p），用于 xvp 模式轮换；非空时覆盖 custom-table
+    http-mask: true # 是否启用http掩码
+    # http-mask-mode: legacy # 可选：legacy（默认）、stream（split-stream）、poll、auto（先 stream 再 poll）；stream/poll/auto 支持走 CDN/反代
+    # http-mask-tls: true # 可选：仅在 http-mask-mode 为 stream/poll/auto 时生效；true 强制 https；false 强制 http（不会根据端口自动推断）
+    # http-mask-host: "" # 可选：覆盖 Host/SNI（支持 example.com 或 example.com:443）；仅在 http-mask-mode 为 stream/poll/auto 时生效
+    # path-root: "" # 可选：HTTP 隧道端点一级路径前缀（双方需一致），例如 "aabbcc" 或 "/aabbcc/" => /aabbcc/session、/aabbcc/stream、/aabbcc/api/v1/upload
+    # http-mask-multiplex: off # 可选：off（默认）、auto（复用底层 HTTP 连接，减少建链 RTT）、on（Sudoku mux 单隧道多目标；仅在 http-mask-mode=stream/poll/auto 生效）
+    enable-pure-downlink: false # 可选：false=带宽优化下行（更快，要求 aead-method != none）；true=纯 Sudoku 下行
 
   # anytls
   - name: anytls
@@ -1304,7 +1398,7 @@ listeners:
     #   dC5jb20AAA==
     #   -----END ECH KEYS-----
 
-  - name: reidr-in-1
+  - name: redir-in-1
     type: redir
     port: 10811 # 支持使用ports格式，例如200,302 or 200,204,401-429,501-503
     listen: 0.0.0.0
@@ -1336,6 +1430,32 @@ listeners:
     #       password: password
     #   handshake:
     #     dest: test.com:443
+    # kcp-tun:
+    #   enable: false
+    #   key: it's a secrect # pre-shared secret between client and server
+    #   crypt: aes # aes, aes-128, aes-128-gcm, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, none, null
+    #   mode: fast # profiles: fast3, fast2, fast, normal, manual
+    #   conn: 1 # set num of UDP connections to server
+    #   autoexpire: 0 # set auto expiration time(in seconds) for a single UDP connection, 0 to disable
+    #   scavengettl: 600 # set how long an expired connection can live (in seconds)
+    #   ratelimit: 0 # set maximum outgoing speed (in bytes per second) for a single KCP connection, 0 to disable. Also known as packet pacing
+    #   mtu: 1350 # set maximum transmission unit for UDP packets
+    #   sndwnd: 128 # set send window size(num of packets)
+    #   rcvwnd: 512 # set receive window size(num of packets)
+    #   datashard: 10 # set reed-solomon erasure coding - datashard
+    #   parityshard: 3 # set reed-solomon erasure coding - parityshard
+    #   dscp: 0 # set DSCP(6bit)
+    #   nocomp: false # disable compression
+    #   acknodelay: false # flush ack immediately when a packet is received
+    #   nodelay: 0
+    #   interval: 50
+    #   resend: 0
+    #   sockbuf: 4194304 # per-socket buffer in bytes
+    #   smuxver: 1 # specify smux version, available 1,2
+    #   smuxbuf: 4194304 # the overall de-mux buffer in bytes
+    #   framesize: 8192 # smux max frame size
+    #   streambuf: 2097152 # per stream receive buffer in bytes, smux v2+
+    #   keepalive: 10 # seconds between heartbeats
 
   - name: vmess-in-1
     type: vmess
@@ -1499,6 +1619,34 @@ listeners:
     #   dC5jb20AAA==
     #   -----END ECH KEYS-----
     # padding-scheme: "" # https://github.com/anytls/anytls-go/blob/main/docs/protocol.md#cmdupdatepaddingscheme
+
+  - name: mieru-in-1
+    type: mieru
+    port: 10818 # 支持使用ports格式，例如200,302 or 200,204,401-429,501-503
+    listen: 0.0.0.0
+    transport: TCP # 支持 TCP 或者 UDP
+    users:
+      username1: password1
+      username2: password2
+
+  - name: sudoku-in-1
+    type: sudoku
+    port: 8443 # 仅支持单端口
+    listen: 0.0.0.0
+    key: "<server_key>" # 如果你使用sudoku生成的ED25519密钥对，此处是密钥对中的公钥，当然，你也可以仅仅使用任意uuid充当key
+    aead-method: chacha20-poly1305 # 可选：chacha20-poly1305、aes-128-gcm、none（不建议；且 enable-pure-downlink=false 时不可用）
+    padding-min: 1 # 最小填充率（0-100）
+    padding-max: 15 # 最大填充率（0-100，必须 >= padding-min）
+    table-type: prefer_ascii # 可选值：prefer_ascii、prefer_entropy 前者全ascii映射，后者保证熵值（汉明1）低于3
+    # custom-table: xpxvvpvv # 可选，自定义字节布局，必须包含2个x、2个p、4个v，可随意组合。启用此处则需配置`table-type`为`prefer_entropy`
+    # custom-tables: ["xpxvvpvv", "vxpvxvvp"] # 可选，自定义字节布局列表（x/v/p），用于 xvp 模式轮换；非空时覆盖 custom-table
+    handshake-timeout: 5   # 可选（秒）
+    enable-pure-downlink: false # 可选：false=带宽优化下行（更快，要求 aead-method != none）；true=纯 Sudoku 下行
+    disable-http-mask: false # 可选：禁用 http 掩码/隧道（默认为 false）
+    # http-mask-mode: legacy # 可选：legacy（默认）、stream（split-stream）、poll、auto（先 stream 再 poll）；stream/poll/auto 支持走 CDN/反代
+    # path-root: "" # 可选：HTTP 隧道端点一级路径前缀（双方需一致），例如 "aabbcc" 或 "/aabbcc/" => /aabbcc/session、/aabbcc/stream、/aabbcc/api/v1/upload
+
+
 
   - name: trojan-in-1
     type: trojan

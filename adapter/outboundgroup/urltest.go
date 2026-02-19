@@ -11,7 +11,7 @@ import (
 	"github.com/metacubex/mihomo/common/singledo"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/constant/provider"
+	P "github.com/metacubex/mihomo/constant/provider"
 )
 
 type urlTestOption func(*URLTest)
@@ -185,6 +185,14 @@ func (u *URLTest) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (u *URLTest) Providers() []P.ProxyProvider {
+	return u.providers
+}
+
+func (u *URLTest) Proxies() []C.Proxy {
+	return u.GetProxies(false)
+}
+
 func (u *URLTest) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {
 	return u.GroupBase.URLTest(ctx, u.testUrl, expectedStatus)
 }
@@ -202,7 +210,7 @@ func parseURLTestOption(config map[string]any) []urlTestOption {
 	return opts
 }
 
-func NewURLTest(option *GroupCommonOption, providers []provider.ProxyProvider, options ...urlTestOption) *URLTest {
+func NewURLTest(option *GroupCommonOption, providers []P.ProxyProvider, options ...urlTestOption) *URLTest {
 	urlTest := &URLTest{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,

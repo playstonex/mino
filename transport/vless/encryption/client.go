@@ -12,12 +12,12 @@ import (
 	"time"
 
 	"github.com/metacubex/blake3"
-	"github.com/metacubex/utls/mlkem"
-	"golang.org/x/sys/cpu"
+	"github.com/metacubex/cpu"
+	"github.com/metacubex/mlkem"
 )
 
 var (
-	// Keep in sync with crypto/tls/cipher_suites.go.
+	// Keep in sync with crypto/internal/fips140/aes/gcm.supportsAESGCM.
 	hasGCMAsmAMD64 = cpu.X86.HasAES && cpu.X86.HasPCLMULQDQ && cpu.X86.HasSSE41 && cpu.X86.HasSSSE3
 	hasGCMAsmARM64 = cpu.ARM64.HasAES && cpu.ARM64.HasPMULL
 	hasGCMAsmS390X = cpu.S390X.HasAES && cpu.S390X.HasAESCTR && cpu.S390X.HasGHASH

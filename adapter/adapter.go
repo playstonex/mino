@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -17,6 +16,8 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
+
+	"github.com/metacubex/http"
 )
 
 var UnifiedDelay = atomic.NewBool(false)
@@ -51,24 +52,10 @@ func (p *Proxy) AliveForTestUrl(url string) bool {
 	return p.alive.Load()
 }
 
-// Dial implements C.Proxy
-func (p *Proxy) Dial(metadata *C.Metadata) (C.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
-	defer cancel()
-	return p.DialContext(ctx, metadata)
-}
-
 // DialContext implements C.ProxyAdapter
 func (p *Proxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
 	conn, err := p.ProxyAdapter.DialContext(ctx, metadata)
 	return conn, err
-}
-
-// DialUDP implements C.ProxyAdapter
-func (p *Proxy) DialUDP(metadata *C.Metadata) (C.PacketConn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
-	defer cancel()
-	return p.ListenPacketContext(ctx, metadata)
 }
 
 // ListenPacketContext implements C.ProxyAdapter
@@ -167,8 +154,9 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	mapping["mptcp"] = proxyInfo.MPTCP
 	mapping["smux"] = proxyInfo.SMUX
 	mapping["interface"] = proxyInfo.Interface
-	mapping["dialer-proxy"] = proxyInfo.DialerProxy
 	mapping["routing-mark"] = proxyInfo.RoutingMark
+	mapping["provider-name"] = proxyInfo.ProviderName
+	mapping["dialer-proxy"] = proxyInfo.DialerProxy
 
 	return json.Marshal(mapping)
 }
@@ -191,14 +179,12 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 			p.history.Pop()
 		}
 
-		state, ok := p.extra.Load(url)
-		if !ok {
-			state = &internalProxyState{
+		state, _ := p.extra.LoadOrStoreFn(url, func() *internalProxyState {
+			return &internalProxyState{
 				history: queue.New[C.DelayHistory](defaultHistoriesNum),
 				alive:   atomic.NewBool(true),
 			}
-			p.extra.Store(url, state)
-		}
+		})
 
 		if !satisfied {
 			record.Delay = 0

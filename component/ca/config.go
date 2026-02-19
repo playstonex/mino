@@ -1,7 +1,6 @@
 package ca
 
 import (
-	"crypto/tls"
 	"crypto/x509"
 	_ "embed"
 	"errors"
@@ -11,8 +10,9 @@ import (
 	"sync"
 
 	"github.com/metacubex/mihomo/common/once"
-	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/ntp"
+
+	"github.com/metacubex/tls"
 )
 
 var globalCertPool *x509.CertPool
@@ -98,20 +98,27 @@ func GetTLSConfig(opt Option) (tlsConfig *tls.Config, err error) {
 	}
 
 	if len(opt.Fingerprint) > 0 {
-		tlsConfig.VerifyPeerCertificate, err = NewFingerprintVerifier(opt.Fingerprint, tlsConfig.Time)
+		verifier, err := NewFingerprintVerifier(opt.Fingerprint, tlsConfig.Time)
 		if err != nil {
 			return nil, err
+		}
+		tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
+			// [ConnectionState.ServerName] can return the actual ServerName needed for verification,
+			// avoiding inconsistencies caused by [tlsConfig.ServerName] being modified after the [NewFingerprintVerifier] call.
+			// https://github.com/golang/go/issues/36736#issuecomment-587925536
+			return verifier(state.PeerCertificates, state.ServerName)
 		}
 		tlsConfig.InsecureSkipVerify = true
 	}
 
 	if len(opt.Certificate) > 0 || len(opt.PrivateKey) > 0 {
-		var cert tls.Certificate
-		cert, err = LoadTLSKeyPair(opt.Certificate, opt.PrivateKey, C.Path)
+		certLoader, err := NewTLSKeyPairLoader(opt.Certificate, opt.PrivateKey)
 		if err != nil {
 			return nil, err
 		}
-		tlsConfig.Certificates = []tls.Certificate{cert}
+		tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return certLoader()
+		}
 	}
 	return tlsConfig, nil
 }

@@ -10,7 +10,7 @@ import (
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/constant/provider"
+	P "github.com/metacubex/mihomo/constant/provider"
 )
 
 type Fallback struct {
@@ -150,7 +150,15 @@ func (f *Fallback) ForceSet(name string) {
 	f.selected = name
 }
 
-func NewFallback(option *GroupCommonOption, providers []provider.ProxyProvider) *Fallback {
+func (f *Fallback) Providers() []P.ProxyProvider {
+	return f.providers
+}
+
+func (f *Fallback) Proxies() []C.Proxy {
+	return f.GetProxies(false)
+}
+
+func NewFallback(option *GroupCommonOption, providers []P.ProxyProvider) *Fallback {
 	return &Fallback{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,

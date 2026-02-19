@@ -2,13 +2,14 @@ package vmess
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"net"
 
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
 	tlsC "github.com/metacubex/mihomo/component/tls"
+
+	"github.com/metacubex/tls"
 )
 
 type TLSConfig struct {
@@ -43,38 +44,28 @@ func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn
 	}
 
 	if clientFingerprint, ok := tlsC.GetFingerprint(cfg.ClientFingerprint); ok {
+		if cfg.Reality != nil {
+			return tlsC.GetRealityConn(ctx, conn, clientFingerprint, tlsConfig.ServerName, cfg.Reality)
+		}
 		tlsConfig := tlsC.UConfig(tlsConfig)
-		err = cfg.ECH.ClientHandle(ctx, tlsConfig)
+		err = cfg.ECH.ClientHandleUTLS(ctx, tlsConfig)
 		if err != nil {
 			return nil, err
 		}
-
-		if cfg.Reality == nil {
-			tlsConn := tlsC.UClient(conn, tlsConfig, clientFingerprint)
-			err = tlsConn.HandshakeContext(ctx)
-			if err != nil {
-				return nil, err
-			}
-			return tlsConn, nil
-		} else {
-			return tlsC.GetRealityConn(ctx, conn, clientFingerprint, tlsConfig, cfg.Reality)
+		tlsConn := tlsC.UClient(conn, tlsConfig, clientFingerprint)
+		err = tlsConn.HandshakeContext(ctx)
+		if err != nil {
+			return nil, err
 		}
+		return tlsConn, nil
 	}
 	if cfg.Reality != nil {
 		return nil, errors.New("REALITY is based on uTLS, please set a client-fingerprint")
 	}
 
-	if cfg.ECH != nil {
-		tlsConfig := tlsC.UConfig(tlsConfig)
-		err = cfg.ECH.ClientHandle(ctx, tlsConfig)
-		if err != nil {
-			return nil, err
-		}
-
-		tlsConn := tlsC.Client(conn, tlsConfig)
-
-		err = tlsConn.HandshakeContext(ctx)
-		return tlsConn, err
+	err = cfg.ECH.ClientHandle(ctx, tlsConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	tlsConn := tls.Client(conn, tlsConfig)
