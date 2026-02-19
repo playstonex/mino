@@ -52,11 +52,11 @@ require (
 	gitlab.com/go-extension/aes-ccm v0.0.0-20230221065045-e58665ef23c7
 	go.uber.org/automaxprocs v1.6.0
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
-	golang.org/x/crypto v0.41.0 // lastest version compatible with golang1.20
+	golang.org/x/crypto v0.42.0 // lastest version compatible with golang1.20
 	golang.org/x/exp v0.0.0-20250819193227-8b4c13bb791b // lastest version compatible with golang1.20
-	golang.org/x/net v0.43.0 // lastest version compatible with golang1.20
-	golang.org/x/sync v0.16.0 // lastest version compatible with golang1.20
-	golang.org/x/sys v0.35.0 // lastest version compatible with golang1.20
+	golang.org/x/net v0.44.0 // lastest version compatible with golang1.20
+	golang.org/x/sync v0.17.0 // lastest version compatible with golang1.20
+	golang.org/x/sys v0.36.0 // lastest version compatible with golang1.20
 	google.golang.org/protobuf v1.36.8 // lastest version compatible with golang1.20
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -80,8 +80,6 @@ require (
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/pprof v0.0.0-20210407192527-94a9f03dee38 // indirect
-	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/josharian/native v1.1.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20250821153705-5981dea3221d // indirect
@@ -107,9 +105,9 @@ require (
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	gitlab.com/yawning/bsaes.git v0.0.0-20190805113838-0a714cd429ec // indirect
 	go.uber.org/mock v0.6.0 // indirect
-	golang.org/x/mobile v0.0.0-20250813145510-f12310a0cfd9 // indirect
-	golang.org/x/mod v0.27.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
+	golang.org/x/mobile v0.0.0-20250911085028-6912353760cf // indirect
+	golang.org/x/mod v0.28.0 // indirect
+	golang.org/x/text v0.29.0 // indirect
 	golang.org/x/time v0.12.0 // indirect
-	golang.org/x/tools v0.36.0 // indirect
+	golang.org/x/tools v0.37.0 // indirect
 )
