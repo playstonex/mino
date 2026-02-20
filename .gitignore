@@ -9,6 +9,7 @@ mihomo/*
 mate.xcframework/*
 # Test binary, build with `go test -c`
 *.test
+/build/*
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
