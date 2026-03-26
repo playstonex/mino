@@ -179,8 +179,8 @@ jobs:
         tar zxf go1.26.0.linux-amd64-abi1.tar.gz -C $HOME/usr/local
         echo "$HOME/usr/local/go/bin" >> $GITHUB_PATH
 
-      # TODO: remove after issue77731 merged, see: https://github.com/golang/go/issues/77731
-    - name: Apply issue77731 for Golang1.26
+      # TODO: remove after issue77731 fixed, see: https://github.com/golang/go/issues/77731
+    - name: Fix issue77731 for Golang1.26
       if: ${{ matrix.jobs.goversion == '' }}
       run: |
         cd $(go env GOROOT)
