@@ -513,8 +513,6 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 		}
 	}
 
-	//l.openAndroidHotspot(tunOptions)
-
 	if !l.options.AutoDetectInterface {
 		resolver.ResetConnection()
 	}
