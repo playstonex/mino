@@ -32,6 +32,67 @@ cleanup_work_tmp() {
 }
 trap cleanup_work_tmp EXIT
 
+# Normalize gomobile macOS framework naming so all slices expose a single Swift module: Mate.
+normalize_macos_framework_slice() {
+    local slice_dir="$1"
+    local framework_dir
+    framework_dir="$(find "$slice_dir" -maxdepth 1 -type d -name "*.framework" | head -n 1)"
+
+    if [ -z "$framework_dir" ]; then
+        echo_error "No framework found in macOS slice: $slice_dir"
+        exit 1
+    fi
+
+    local original_name
+    original_name="$(basename "$framework_dir" .framework)"
+
+    # If already normalized, skip
+    if [ "$original_name" != "$FRAMEWORK_NAME" ]; then
+        mv "$framework_dir" "$slice_dir/${FRAMEWORK_NAME}.framework"
+        framework_dir="$slice_dir/${FRAMEWORK_NAME}.framework"
+    fi
+
+    local base_path="$framework_dir/Versions/A"
+
+    # Rename binary if needed
+    if [ -f "$base_path/${original_name}" ]; then
+        mv "$base_path/${original_name}" "$base_path/$FRAMEWORK_NAME"
+    fi
+
+    # Update umbrella header
+    if [ -f "$base_path/Headers/${original_name}.h" ]; then
+        mv "$base_path/Headers/${original_name}.h" "$base_path/Headers/${FRAMEWORK_NAME}.h"
+        sed -i '' "s/${original_name}/${FRAMEWORK_NAME}/g" "$base_path/Headers/${FRAMEWORK_NAME}.h"
+    elif [ -f "$base_path/Headers/${original_name}_macos_arm64.h" ]; then
+        mv "$base_path/Headers/${original_name}_macos_arm64.h" "$base_path/Headers/${FRAMEWORK_NAME}.h"
+        sed -i '' "s/${original_name}_macos_arm64/${FRAMEWORK_NAME}/g" "$base_path/Headers/${FRAMEWORK_NAME}.h"
+    fi
+
+    # Update modulemap
+    if [ -f "$base_path/Modules/module.modulemap" ]; then
+        sed -i '' -E \
+            "s/^framework module \"[^\"]+\"/framework module \"${FRAMEWORK_NAME}\"/" \
+            "$base_path/Modules/module.modulemap"
+        
+        # Determine the header file name that was used in the modulemap
+        # It's likely ${original_name}.h or ${original_name}_macos_arm64.h
+        sed -i '' "s/header \"[^\"]*_macos_arm64.h\"/header \"${FRAMEWORK_NAME}.h\"/" "$base_path/Modules/module.modulemap"
+        sed -i '' "s/header \"${original_name}.h\"/header \"${FRAMEWORK_NAME}.h\"/" "$base_path/Modules/module.modulemap"
+    fi
+
+    # Update Info.plist
+    if [ -f "$base_path/Resources/Info.plist" ]; then
+        /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $FRAMEWORK_NAME" "$base_path/Resources/Info.plist" >/dev/null
+        /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${FRAMEWORK_NAME}-macos" "$base_path/Resources/Info.plist" >/dev/null
+    fi
+
+    # Update main framework symlinks
+    cd "$framework_dir"
+    rm -f "$original_name"
+    ln -sf "Versions/Current/$FRAMEWORK_NAME" "$FRAMEWORK_NAME"
+    cd - >/dev/null
+}
+
 # Normalize gomobile iOS framework naming so all slices expose a single Swift module: Mate.
 normalize_ios_framework_slice() {
     local slice_dir="$1"
@@ -194,6 +255,9 @@ EOF
     # Clean up intermediate frameworks
     rm -rf "$OUTPUT_DIR/${FRAMEWORK_NAME}_macos_arm64.xcframework"
     rm -rf "$OUTPUT_DIR/${FRAMEWORK_NAME}_macos_amd64.xcframework"
+
+    # Normalize
+    normalize_macos_framework_slice "$OUTPUT_DIR/${FRAMEWORK_NAME}_macOS.xcframework/macos-arm64_x86_64"
 
     echo_info "✅ macOS XCFramework created: $OUTPUT_DIR/${FRAMEWORK_NAME}_macOS.xcframework"
 }
@@ -358,7 +422,7 @@ build_unified() {
     cp -R "$ios_sim_framework/${FRAMEWORK_NAME}_ios_simulator.xcframework/ios-arm64-simulator" \
         "$unified_path/ios-arm64-simulator"
 
-    # Normalize framework/module names so Swift uses `import Mate` on all iOS slices.
+    # Normalize framework/module names so Swift uses `import Mate` on all iOS/macOS slices.
     normalize_ios_framework_slice "$unified_path/ios-arm64"
     normalize_ios_framework_slice "$unified_path/ios-arm64-simulator"
     
@@ -386,6 +450,8 @@ build_unified() {
     rm -f "${FRAMEWORK_NAME}_macos_arm64" "${FRAMEWORK_NAME}_macos_amd64"
     ln -sf "Versions/Current/${FRAMEWORK_NAME}" "${FRAMEWORK_NAME}"
     cd - > /dev/null
+
+    normalize_macos_framework_slice "$unified_path/macos-arm64_x86_64"
     
     echo_info "Step 3: Creating unified Info.plist..."
     

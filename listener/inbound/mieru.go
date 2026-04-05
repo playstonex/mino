@@ -87,15 +87,22 @@ func (m *Mieru) Listen(tunnel C.Tunnel) error {
 	}
 
 	go func() {
+		consecutiveErrors := 0
+		const maxConsecutiveErrors = 100
 		for {
 			c, req, err := m.server.Accept()
 			if err != nil {
 				if !m.server.IsRunning() {
 					break
-				} else {
-					continue
 				}
+				consecutiveErrors++
+				if consecutiveErrors >= maxConsecutiveErrors {
+					log.Errorln("Mieru[%s] too many consecutive accept errors, stopping", m.Name())
+					break
+				}
+				continue
 			}
+			consecutiveErrors = 0
 			go mieru.Handle(c, tunnel, req, additions...)
 		}
 	}()

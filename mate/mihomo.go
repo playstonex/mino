@@ -8,6 +8,7 @@ import (
 	// "github.com/metacubex/mihomo/config"
 	// "github.com/metacubex/mihomo/service"
 
+	"github.com/metacubex/mihomo/transport/p2p"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
 
@@ -51,11 +52,31 @@ func Start(config *ServerConfig, platformInterface PlatformInterface) error {
 	if err != nil {
 		return err
 	}
+
+	globalOverlayTransport.Reset()
+	globalOverlayTransport.SetPlatform(platformInterface)
+
+	// Reset P2P state from any previous session (Close+Start restart cycle
+	// leaves the singleton manager with stale PeerConnections and callbacks).
+	m := p2p.GetManager()
+	m.Reset()
+
+	// Register P2P signaling callbacks
+	m.OnLocalDescription = func(peerID string, sdp string, sdpType string) {
+		platformInterface.OnLocalDescription(peerID, sdp, sdpType)
+	}
+	m.OnLocalCandidate = func(peerID string, candidate string) {
+		platformInterface.OnLocalCandidate(peerID, candidate)
+	}
+	m.OnConnectionStateChange = func(peerID string, state string) {
+		platformInterface.OnP2PConnectionStateChange(peerID, state)
+	}
+
 	SetTunCreator(globalService.plantformWrapper)
 	return globalService.Start()
 }
-
 func Close() error {
+	globalOverlayTransport.Reset()
 	if globalService != nil {
 		return globalService.Close()
 	}

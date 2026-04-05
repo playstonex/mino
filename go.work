@@ -1,6 +1,6 @@
 go 1.25.0
 
 use (
-	.
-	/Users/lei/go/src/golang.org/x/mobile
+    .
+    /Volumes/y/lei/go/src/golang.org/x/mobile
 )

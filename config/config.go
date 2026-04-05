@@ -273,9 +273,9 @@ type RawTun struct {
 	AutoDetectInterface bool       `yaml:"auto-detect-interface"`
 
 	MTU        uint32 `yaml:"mtu" json:"mtu,omitempty"`
-	GSO        bool   `yaml:"gso" json:"gso,omitempty"`
-	GSOMaxSize uint32 `yaml:"gso-max-size" json:"gso-max-size,omitempty"`
-	//Inet4Address           []netip.Prefix `yaml:"inet4-address" json:"inet4-address,omitempty"`
+	GSO        bool           `yaml:"gso" json:"gso,omitempty"`
+	GSOMaxSize uint32         `yaml:"gso-max-size" json:"gso-max-size,omitempty"`
+	Inet4Address                          []netip.Prefix `yaml:"inet4-address" json:"inet4-address,omitempty"`
 	Inet6Address                          []netip.Prefix `yaml:"inet6-address" json:"inet6-address,omitempty"`
 	IPRoute2TableIndex                    int            `yaml:"iproute2-table-index" json:"iproute2-table-index,omitempty"`
 	IPRoute2RuleIndex                     int            `yaml:"iproute2-rule-index" json:"iproute2-rule-index,omitempty"`
@@ -1642,6 +1642,13 @@ func parseTun(rawTun RawTun, dns *DNS, general *General) error {
 	}
 	tunAddressPrefix = netip.PrefixFrom(tunAddressPrefix.Addr(), 30)
 
+	var inet4Addresses []netip.Prefix
+	if len(rawTun.Inet4Address) > 0 {
+		inet4Addresses = rawTun.Inet4Address
+	} else {
+		inet4Addresses = []netip.Prefix{tunAddressPrefix}
+	}
+
 	general.Tun = LC.Tun{
 		Enable:              rawTun.Enable,
 		Device:              rawTun.Device,
@@ -1653,7 +1660,7 @@ func parseTun(rawTun RawTun, dns *DNS, general *General) error {
 		MTU:                                   rawTun.MTU,
 		GSO:                                   rawTun.GSO,
 		GSOMaxSize:                            rawTun.GSOMaxSize,
-		Inet4Address:                          []netip.Prefix{tunAddressPrefix},
+		Inet4Address:                          inet4Addresses,
 		Inet6Address:                          rawTun.Inet6Address,
 		IPRoute2TableIndex:                    rawTun.IPRoute2TableIndex,
 		IPRoute2RuleIndex:                     rawTun.IPRoute2RuleIndex,

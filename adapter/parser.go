@@ -167,14 +167,20 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		}
 		proxy, err = outbound.NewMasque(*masqueOption)
 	case "trusttunnel":
-		trustTunnelOption := &outbound.TrustTunnelOption{BasicOption: basicOption}
-		err = decoder.Decode(mapping, trustTunnelOption)
-		if err != nil {
-			break
-		}
-		proxy, err = outbound.NewTrustTunnel(*trustTunnelOption)
-	default:
-		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
+	        trustTunnelOption := &outbound.TrustTunnelOption{BasicOption: basicOption}
+	        err = decoder.Decode(mapping, trustTunnelOption)
+	        if err != nil {
+	                break
+	        }
+	        proxy, err = outbound.NewTrustTunnel(*trustTunnelOption)
+	case "p2p":
+	        p2pOption := &outbound.P2POption{BasicOption: basicOption}
+	        err = decoder.Decode(mapping, p2pOption)
+	        if err != nil {
+	                break
+	        }
+	        proxy, err = outbound.NewP2P(*p2pOption)
+	default:		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}
 
 	if err != nil {

@@ -21,8 +21,13 @@ type PlatformInterface interface {
 	SystemCertificates() StringIterator
 	ClearDNSCache()
 	SendNotification(notification *Notification) error
-}
 
+	// P2P Signaling
+	OnLocalDescription(peerID string, sdp string, sdpType string)
+	OnLocalCandidate(peerID string, candidate string)
+	OnP2PConnectionStateChange(peerID string, state string)
+	OnOverlayPacket(peerID string, payload []byte)
+}
 type TunInterface interface {
 	FileDescriptor() int32
 	Close() error

@@ -51,6 +51,7 @@ func (s *MihomoService) Start() error {
 }
 
 func (s *MihomoService) Close() error {
+	s.cancel()
 	executor.Shutdown()
 	return nil
 }

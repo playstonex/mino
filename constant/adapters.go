@@ -47,8 +47,8 @@ const (
 	Sudoku
 	Masque
 	TrustTunnel
-)
-
+	P2P
+	)
 const (
 	DefaultTCPTimeout = dialer.DefaultTCPTimeout
 	DefaultUDPTimeout = dialer.DefaultUDPTimeout
@@ -217,9 +217,10 @@ func (at AdapterType) String() string {
 	case Masque:
 		return "Masque"
 	case TrustTunnel:
-		return "TrustTunnel"
-	case Relay:
-		return "Relay"
+	        return "TrustTunnel"
+	case P2P:
+	        return "P2P"
+	case Relay:		return "Relay"
 	case Selector:
 		return "Selector"
 	case Fallback:

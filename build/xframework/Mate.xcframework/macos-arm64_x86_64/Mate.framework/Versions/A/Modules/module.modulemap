@@ -1,0 +1,8 @@
+framework module "Mate" {
+	header "ref.h"
+    header "Mate.objc.h"
+    header "Universe.objc.h"
+    header "Mate.h"
+
+    export *
+}
