@@ -2,6 +2,8 @@ package p2p
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -33,12 +35,16 @@ type Manager struct {
 
 	// Connection state callback
 	OnConnectionStateChange func(peerID string, state string)
+
+	// Optional logger for P2P/ICE diagnostics
+	Logger func(format string, args ...any)
 }
 
 // packetMsg carries a datagram read from a DataChannel.
 type packetMsg struct {
 	data []byte
 	addr net.Addr
+	pc   net.PacketConn
 }
 
 func GetManager() *Manager {
@@ -60,6 +66,48 @@ func (m *Manager) SetICEServers(urls []string) {
 	m.Mu.Lock()
 	defer m.Mu.Unlock()
 	m.iceServers = servers
+}
+
+// iceServerJSON is the JSON representation of a WebRTC ICE server,
+// supporting STUN (urls only) and TURN (urls + username + credential).
+type iceServerJSON struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
+// SetICEServersFromJSON parses a JSON array of ICE server configs and stores them.
+// Accepts both STUN-only servers (just "urls") and TURN servers with auth.
+// JSON format: [{"urls":["stun:host:port"]}, {"urls":["turn:host:port"], "username":"u", "credential":"p"}]
+func (m *Manager) SetICEServersFromJSON(jsonStr string) error {
+	var raw []iceServerJSON
+	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
+		return fmt.Errorf("invalid ICE servers JSON: %w", err)
+	}
+	servers := make([]webrtc.ICEServer, len(raw))
+	for i, s := range raw {
+		servers[i] = webrtc.ICEServer{
+			URLs:       s.URLs,
+			Username:   s.Username,
+			Credential: s.Credential,
+		}
+	}
+	m.Mu.Lock()
+	defer m.Mu.Unlock()
+	m.iceServers = servers
+	return nil
+}
+
+func (m *Manager) logf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	m.Mu.RLock()
+	logger := m.Logger
+	m.Mu.RUnlock()
+	if logger != nil {
+		logger(msg)
+	} else {
+		fmt.Printf("%s\n", msg)
+	}
 }
 
 func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
@@ -96,7 +144,6 @@ func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
 			iface != "Meta" &&
 			iface != "Meta-tun"
 	})
-	settingEngine.DetachDataChannels()
 
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
 
@@ -107,19 +154,22 @@ func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
+			m.logf("[P2P] peer %s: ICE gathering complete", peerID)
 			return
 		}
+		m.logf("[P2P] peer %s: local ICE candidate: %s", peerID, c.ToJSON().Candidate)
 		if m.OnLocalCandidate != nil {
 			m.OnLocalCandidate(peerID, c.ToJSON().Candidate)
 		}
 	})
 
 	pc.OnICEGatheringStateChange(func(s webrtc.ICEGatheringState) {
-		// Log ICE gathering state changes for debugging
+		m.logf("[P2P] peer %s: ICE gathering state: %s", peerID, s.String())
 	})
 
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		stateStr := s.String()
+		m.logf("[P2P] peer %s: connection state: %s", peerID, stateStr)
 		if m.OnConnectionStateChange != nil {
 			m.OnConnectionStateChange(peerID, stateStr)
 		}
@@ -129,6 +179,11 @@ func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
 			m.closePeerIfCurrent(peerID, pc)
 		}
 	})
+
+	// Note: pc.ICETransport() and pc.SCTPTransport() are private in pion v4,
+	// so we can't log the selected candidate pair without internal access.
+	// The connection state and gathering state logs above provide enough
+	// diagnostic info.
 
 	m.Mu.Lock()
 	m.Peers[peerID] = pc
@@ -301,13 +356,11 @@ func NewDataChannelConn(dc *webrtc.DataChannel) *DataChannelConn {
 		copy(data, msg.Data)
 		select {
 		case <-conn.closed:
-			// Safely ignore incoming data if conn is already terminating
 		default:
 			select {
 			case <-conn.closed:
 			case conn.readCh <- data:
 			default:
-				// If buffer overflows, drop.
 			}
 		}
 	})
@@ -315,8 +368,6 @@ func NewDataChannelConn(dc *webrtc.DataChannel) *DataChannelConn {
 	closeFunc := func() {
 		conn.closeOnce.Do(func() {
 			close(conn.closed)
-			// DO NOT close(readCh) here to prevent "send on closed channel" PANICS from concurrent OnMessage!
-			// readCh will be garbage collected safely.
 		})
 	}
 	dc.OnClose(closeFunc)
@@ -334,7 +385,6 @@ func (c *DataChannelConn) Read(b []byte) (n int, err error) {
 
 	select {
 	case <-c.closed:
-		// Drain any remaining buffered data before returning EOF
 		select {
 		case msg := <-c.readCh:
 			n = copy(b, msg)
@@ -400,7 +450,6 @@ func NewPacketDataChannelConn(dc *webrtc.DataChannel) *PacketDataChannelConn {
 	}
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		// Copy data since msg.Data may be reused by pion
 		data := make([]byte, len(msg.Data))
 		copy(data, msg.Data)
 		select {
@@ -410,7 +459,6 @@ func NewPacketDataChannelConn(dc *webrtc.DataChannel) *PacketDataChannelConn {
 			case <-conn.closed:
 			case conn.msgCh <- packetMsg{data: data, addr: conn.rAddr}:
 			default:
-				// Channel full — drop packet
 			}
 		}
 	})

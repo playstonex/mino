@@ -148,13 +148,7 @@ func StartP2POffer(peerID string) error {
 		return err
 	}
 
-	// Use unreliable + unordered DataChannel for IP packet transport
-	ordered := false
-	maxRetransmits := uint16(0)
-	dc, err := pc.CreateDataChannel("mate-overlay", &webrtc.DataChannelInit{
-		Ordered:        &ordered,
-		MaxRetransmits: &maxRetransmits,
-	})
+	dc, err := pc.CreateDataChannel("mate-overlay", &webrtc.DataChannelInit{})
 	if err != nil {
 		return err
 	}
@@ -187,6 +181,13 @@ func StartP2POffer(peerID string) error {
 // SetICEServers configures ICE servers for WebRTC connections
 func SetICEServers(serverURLs []string) {
 	p2p.GetManager().SetICEServers(serverURLs)
+}
+
+// SetICEServersJSON configures ICE servers (including TURN with credentials) from a JSON string.
+// Gomobile can export string parameters but not []string, so this is the Swift-callable version.
+// JSON format: [{"urls":["stun:host:port"]}, {"urls":["turn:host:port"], "username":"u", "credential":"p"}]
+func SetICEServersJSON(jsonStr string) error {
+	return p2p.GetManager().SetICEServersFromJSON(jsonStr)
 }
 
 // RemoveP2PPeer removes a P2P peer connection to allow retry

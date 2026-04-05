@@ -286,6 +286,13 @@ FOUNDATION_EXPORT void MateSetHomeDir(NSString* _Nullable homeDir);
 // skipped function SetICEServers with unsupported parameter or return types
 
 
+/**
+ * SetICEServersJSON configures ICE servers (including TURN with credentials) from a JSON string.
+Gomobile can export string parameters but not []string, so this is the Swift-callable version.
+JSON format: [{"urls":["stun:host:port"]}, {"urls":["turn:host:port"], "username":"u", "credential":"p"}]
+ */
+FOUNDATION_EXPORT BOOL MateSetICEServersJSON(NSString* _Nullable jsonStr, NSError* _Nullable* _Nullable error);
+
 FOUNDATION_EXPORT void MateSetLogDir(NSString* _Nullable logDir);
 
 // skipped function SetTunCreator with unsupported parameter or return types
