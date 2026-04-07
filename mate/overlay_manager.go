@@ -1,0 +1,1495 @@
+package mate
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/metacubex/mihomo/transport/p2p"
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
+)
+
+// ---------------------------------------------------------------------------
+// Config — parsed from JSON passed by Swift
+// ---------------------------------------------------------------------------
+
+// OverlayConfig is the JSON configuration passed from Swift to start the
+// overlay manager. All fields mirror the Swift OverlayTunnelConfiguration +
+// key material fields that Swift collects before calling into Go.
+type OverlayConfig struct {
+	ServerURL        string `json:"serverUrl"`
+	AccessToken      string `json:"accessToken"`
+	RefreshToken     string `json:"refreshToken"`
+	LanID            string `json:"lanId"`
+	DeviceID         string `json:"deviceId"`
+	DeviceUUID       string `json:"deviceUuid"`
+	PrivateKeyBase64 string `json:"privateKeyBase64"`
+	Platform         string `json:"platform"`
+	DeviceName       string `json:"deviceName"`
+	TunnelFd         int    `json:"tunnelFd"`
+	Mode             string `json:"mode"`             // "overlay" | "hybrid"
+	HybridConfigPath string `json:"hybridConfigPath"` // hybrid mode only
+	HomeDir          string `json:"homeDir"`
+	PublicKeyBase64  string `json:"publicKeyBase64"`   // optional, computed if empty
+}
+
+// ---------------------------------------------------------------------------
+// Control plane API models (mirror Swift OverlayControlClient)
+// ---------------------------------------------------------------------------
+
+type overlayEnvelope struct {
+	Success bool            `json:"success"`
+	Data    json.RawMessage `json:"data"`
+	Error   string          `json:"error"`
+}
+
+type overlayRegisterRequest struct {
+	PublicKey  string             `json:"publicKey"`
+	Platform   string             `json:"platform"`
+	DeviceName string             `json:"deviceName"`
+	Candidates []overlayCandidate `json:"candidates"`
+}
+
+type overlayRegisterResult struct {
+	Device        overlayDeviceRecord `json:"device"`
+	Peers         []overlayPeer       `json:"peers"`
+	RelayEndpoint string              `json:"relayEndpoint"`
+}
+
+type overlayPeersResponse struct {
+	Items []overlayPeer `json:"items"`
+}
+
+type overlayDeviceRecord struct {
+	ID        string `json:"id"`
+	OverlayIP string `json:"overlayIp"`
+}
+
+type overlayPeer struct {
+	ID            string             `json:"id"`
+	DeviceName    string             `json:"deviceName"`
+	Platform      string             `json:"platform"`
+	OverlayIP     string             `json:"overlayIp"`
+	PublicKey     string             `json:"publicKey"`
+	Status        string             `json:"status"`
+	TransportType string             `json:"transportType"`
+	Candidates    []overlayCandidate `json:"candidates,omitempty"`
+}
+
+type overlayCandidate struct {
+	IP         string `json:"ip"`
+	Port       int    `json:"port"`
+	Type       string `json:"type"`
+	ObservedAt string `json:"observedAt,omitempty"` // ISO8601 string for gomobile compat
+}
+
+type publishCandidatesRequest struct {
+	Candidates []overlayCandidate `json:"candidates"`
+}
+
+type overlayEmptyPayload struct{}
+
+// ---------------------------------------------------------------------------
+// Snapshot (must match Swift OverlayRuntimeSnapshot EXACTLY)
+// ---------------------------------------------------------------------------
+
+type overlaySnapshot struct {
+	Mode           string            `json:"mode"`
+	ServerURL      string            `json:"serverUrl"`
+	LanID          string            `json:"lanId"`
+	DeviceID       string            `json:"deviceId"`
+	OverlayIP      string            `json:"overlayIp"`
+	PeerCount      int               `json:"peerCount"`
+	PeerIDs        []string          `json:"peerIds"`
+	ConnectionMode string            `json:"connectionMode"`
+	Peers          []overlayPeerInfo `json:"peers"`
+}
+
+type overlayPeerInfo struct {
+	ID             string `json:"id"`
+	DeviceName     string `json:"deviceName"`
+	Platform       string `json:"platform"`
+	OverlayIP      string `json:"overlayIp"`
+	PublicKey      string `json:"publicKey"`
+	Status         string `json:"status"`
+	TransportType  string `json:"transportType"`
+}
+
+// ---------------------------------------------------------------------------
+// Peer signaling state machine
+// ---------------------------------------------------------------------------
+
+type peerSignalingState int
+
+const (
+	peerStateIdle peerSignalingState = iota
+	peerStateSDPReceived
+	peerStateConnected
+	peerStateFailed
+)
+
+func (s peerSignalingState) String() string {
+	switch s {
+	case peerStateIdle:
+		return "idle"
+	case peerStateSDPReceived:
+		return "sdpReceived"
+	case peerStateConnected:
+		return "connected"
+	case peerStateFailed:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OverlayManager — central overlay protocol manager
+// ---------------------------------------------------------------------------
+
+// OverlayManager owns all overlay protocol logic: registration, peer
+// discovery, signaling, crypto, routing, and TUN I/O.  It replaces the
+// equivalent Swift code in PacketTunnelProvider + OverlayRouteEngine +
+// OverlayControlClient with a single Go type that runs inside the mate
+// framework alongside mihomo.
+type OverlayManager struct {
+	mu sync.RWMutex
+
+	config     *OverlayConfig
+	httpClient *http.Client
+
+	// Registration state
+	deviceID  string
+	overlayIP string
+	peers     []overlayPeer
+	knownPeerIDs map[string]bool
+
+	// Per-peer crypto: deviceID -> sharedKey
+	peerKeys map[string][]byte
+
+	// Signaling state
+	peerStates     map[string]peerSignalingState
+	seenCandidates map[string]map[string]bool // peerID -> set of sigKeys
+	peerUfrags     map[string]string
+	peerSessionIDs map[string]string
+	offeredPeers   map[string]bool
+	failedPeers    map[string]bool
+
+	// Route table: overlayIP -> peerID
+	routes map[string]string
+
+	// Transport
+	platform PlatformInterface
+
+	// Lifecycle
+	running  atomic.Bool
+	cancelCh chan struct{}
+	tunFd    int
+
+	// Computed public key
+	publicKeyBase64 string
+	privateKey      [32]byte
+}
+
+// NewOverlayManager creates a new (stopped) OverlayManager.
+func NewOverlayManager() *OverlayManager {
+	return &OverlayManager{
+		knownPeerIDs:    make(map[string]bool),
+		peerKeys:        make(map[string][]byte),
+		peerStates:      make(map[string]peerSignalingState),
+		seenCandidates:  make(map[string]map[string]bool),
+		peerUfrags:      make(map[string]string),
+		peerSessionIDs:  make(map[string]string),
+		offeredPeers:    make(map[string]bool),
+		failedPeers:     make(map[string]bool),
+		routes:          make(map[string]string),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+// Start parses the JSON config, registers with the control plane, discovers
+// peers, derives shared keys, wires P2P callbacks, and starts background
+// goroutines for signaling and (in overlay-only mode) TUN I/O.
+func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) error {
+	if m.running.Load() {
+		return fmt.Errorf("overlay manager already running")
+	}
+
+	// 1. Parse config
+	var cfg OverlayConfig
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		return fmt.Errorf("overlay config parse: %w", err)
+	}
+	m.config = &cfg
+	m.platform = platform
+	m.tunFd = cfg.TunnelFd
+
+	// 2. Decode and validate private key
+	privateKeyBytes, err := base64.StdEncoding.DecodeString(cfg.PrivateKeyBase64)
+	if err != nil {
+		return fmt.Errorf("overlay private key decode: %w", err)
+	}
+	if len(privateKeyBytes) != 32 {
+		return fmt.Errorf("overlay private key must be 32 bytes, got %d", len(privateKeyBytes))
+	}
+	copy(m.privateKey[:], privateKeyBytes)
+
+	// 3. Compute public key if not provided
+	if cfg.PublicKeyBase64 != "" {
+		m.publicKeyBase64 = cfg.PublicKeyBase64
+	} else {
+		// curve25519 public key from private key
+		pub, err := curve25519.X25519(m.privateKey[:], curve25519.Basepoint)
+		if err != nil {
+			return fmt.Errorf("overlay public key compute: %w", err)
+		}
+		m.publicKeyBase64 = base64.StdEncoding.EncodeToString(pub)
+	}
+
+	// 4. HTTP client
+	m.httpClient = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+		},
+	}
+
+	// 5. Register with server
+	m.logf("[Overlay] Registering with control plane...")
+	regResult, err := m.register()
+	if err != nil {
+		return fmt.Errorf("overlay register: %w", err)
+	}
+	m.deviceID = regResult.Device.ID
+	m.overlayIP = regResult.Device.OverlayIP
+	m.peers = regResult.Peers
+	for _, p := range regResult.Peers {
+		m.knownPeerIDs[p.ID] = true
+	}
+	m.logf("[Overlay] Registered: deviceID=%s overlayIP=%s peers=%d relayEndpoint=%s",
+		m.deviceID, m.overlayIP, len(regResult.Peers), regResult.RelayEndpoint)
+
+	// 6. Fetch peers (full list)
+	peers, err := m.fetchPeers()
+	if err != nil {
+		m.logf("[Overlay] Warning: fetchPeers failed: %v", err)
+	} else {
+		m.mu.Lock()
+		m.peers = peers
+		for _, p := range peers {
+			m.knownPeerIDs[p.ID] = true
+		}
+		m.mu.Unlock()
+	}
+
+	// 7. Configure overlay transport (relay)
+	resolvedRelay := resolveRelayEndpoint(regResult.RelayEndpoint, cfg.ServerURL)
+	if err := globalOverlayTransport.Configure(resolvedRelay, cfg.AccessToken, m.deviceID); err != nil {
+		m.logf("[Overlay] Warning: overlay transport configure failed: %v", err)
+	}
+	for _, p := range m.peers {
+		if err := globalOverlayTransport.RegisterPeer(p.ID); err != nil {
+			m.logf("[Overlay] Warning: register relay peer %s: %v", p.ID, err)
+		}
+	}
+
+	// 8. Derive shared keys for all peers
+	m.deriveAllPeerKeys()
+
+	// 9. Build route table
+	m.buildRouteTable()
+
+	// 10. Configure ICE servers
+	m.configureICEServers()
+
+	// 11. Wire P2P callbacks directly (no Swift round-trip)
+	m.wireP2PCallbacks()
+
+	// 12. Mark running and start goroutines
+	m.running.Store(true)
+	m.cancelCh = make(chan struct{})
+
+	// 13. Start signaling poll loop
+	go m.signalingLoop()
+
+	// 14. Start TUN fd reader (overlay-only mode)
+	if cfg.Mode == "overlay" && cfg.TunnelFd > 0 {
+		go m.tunReadLoop()
+	}
+
+	// 15. Wait briefly for TUN to stabilize, then initiate P2P offers
+	go func() {
+		time.Sleep(2 * time.Second)
+		m.initiateP2POffers()
+	}()
+
+	// 16. Hybrid mode: inject p2p entries into YAML
+	if cfg.Mode == "hybrid" && cfg.HybridConfigPath != "" {
+		if err := m.injectHybridYAML(); err != nil {
+			m.logf("[Overlay] Warning: hybrid YAML injection failed: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Stop
+// ---------------------------------------------------------------------------
+
+// Stop shuts down the overlay manager, cancels background goroutines, and
+// resets all internal state.
+func (m *OverlayManager) Stop() error {
+	if !m.running.Load() {
+		return nil
+	}
+	m.running.Store(false)
+
+	// Signal goroutines to stop
+	if m.cancelCh != nil {
+		close(m.cancelCh)
+	}
+
+	// Remove all P2P peers
+	mgr := p2p.GetManager()
+	m.mu.RLock()
+	peerIDs := make([]string, 0, len(m.knownPeerIDs))
+	for id := range m.knownPeerIDs {
+		peerIDs = append(peerIDs, id)
+	}
+	m.mu.RUnlock()
+	for _, id := range peerIDs {
+		mgr.RemovePeer(id)
+	}
+
+	// Reset transport
+	globalOverlayTransport.Reset()
+
+	// Reset P2P callbacks
+	mgr.Mu.Lock()
+	mgr.OnLocalDescription = nil
+	mgr.OnLocalCandidate = nil
+	mgr.OnConnectionStateChange = nil
+	mgr.Mu.Unlock()
+
+	m.logf("[Overlay] Stopped")
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot
+// ---------------------------------------------------------------------------
+
+// SnapshotJSON returns a JSON string with the current overlay runtime state,
+// compatible with the Swift OverlayRuntimeSnapshot format consumed by the
+// main app's monitor UI.
+func (m *OverlayManager) SnapshotJSON() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	peerInfos := make([]overlayPeerInfo, 0, len(m.peers))
+	for _, p := range m.peers {
+		state := m.peerStates[p.ID]
+		transportType := "relay"
+		switch state {
+		case peerStateConnected:
+			transportType = "p2p"
+		case peerStateSDPReceived:
+			transportType = "connecting"
+		}
+		dname := p.DeviceName
+		if dname == "" {
+			dname = "Unknown"
+		}
+		plat := p.Platform
+		if plat == "" {
+			plat = "unknown"
+		}
+		peerInfos = append(peerInfos, overlayPeerInfo{
+			ID:             p.ID,
+			DeviceName:     dname,
+			Platform:       plat,
+			OverlayIP:      p.OverlayIP,
+			PublicKey:      p.PublicKey,
+			Status:         p.Status,
+			TransportType:  transportType,
+		})
+	}
+
+	peerIDs := make([]string, 0, len(m.peers))
+	for _, p := range m.peers {
+		peerIDs = append(peerIDs, p.ID)
+	}
+
+	modeStr := m.config.Mode
+	connectionMode := "mate-core"
+	if !m.running.Load() {
+		connectionMode = "disconnected"
+	}
+
+	snap := overlaySnapshot{
+		Mode:           modeStr,
+		ServerURL:      m.config.ServerURL,
+		LanID:          m.config.LanID,
+		DeviceID:       m.deviceID,
+		OverlayIP:      m.overlayIP,
+		PeerCount:      len(m.peers),
+		PeerIDs:        peerIDs,
+		ConnectionMode: connectionMode,
+		Peers:          peerInfos,
+	}
+
+	data, err := json.Marshal(snap)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+// ---------------------------------------------------------------------------
+// Crypto — key derivation, encryption, decryption
+// ---------------------------------------------------------------------------
+
+// deriveSharedKey performs X25519 ECDH and HKDF-SHA256 to derive a shared
+// symmetric key from the local private key and a peer's public key.
+func (m *OverlayManager) deriveSharedKey(peerPublicKeyBase64 string) ([]byte, error) {
+	peerPubBytes, err := base64.StdEncoding.DecodeString(peerPublicKeyBase64)
+	if err != nil {
+		return nil, fmt.Errorf("decode peer public key: %w", err)
+	}
+	if len(peerPubBytes) != 32 {
+		return nil, fmt.Errorf("peer public key must be 32 bytes, got %d", len(peerPubBytes))
+	}
+
+	sharedSecret, err := curve25519.X25519(m.privateKey[:], peerPubBytes)
+	if err != nil {
+		return nil, fmt.Errorf("X25519: %w", err)
+	}
+
+	// HKDF-SHA256(sharedSecret, salt=empty, info="overlay-v1", length=32)
+	reader := hkdf.New(sha256.New, sharedSecret, nil, []byte("overlay-v1"))
+	sharedKey := make([]byte, 32)
+	if _, err := io.ReadFull(reader, sharedKey); err != nil {
+		return nil, fmt.Errorf("HKDF: %w", err)
+	}
+	return sharedKey, nil
+}
+
+// deriveAllPeerKeys iterates over all known peers and derives a shared key
+// for each one that has a valid public key.
+func (m *OverlayManager) deriveAllPeerKeys() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	newKeys := make(map[string][]byte, len(m.peers))
+	for _, peer := range m.peers {
+		if peer.PublicKey == "" {
+			m.logf("[Overlay] No public key for peer %s, skipping key derivation", peer.ID)
+			continue
+		}
+		key, err := m.deriveSharedKey(peer.PublicKey)
+		if err != nil {
+			m.logf("[Overlay] ECDH failed for peer %s: %v", peer.ID, err)
+			continue
+		}
+		newKeys[peer.ID] = key
+		m.logf("[Overlay] Derived shared key for peer %s", peer.ID)
+	}
+	m.peerKeys = newKeys
+}
+
+// encryptPacket encrypts plaintext using AES-256-GCM. The returned ciphertext
+// has a 12-byte nonce prepended (nonce || sealed), matching the Swift
+// CryptoKit AES.GCM.seal combined format.
+func (m *OverlayManager) encryptPacket(plaintext []byte, sharedKey []byte) ([]byte, error) {
+	block, err := aes.NewCipher(sharedKey)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce := make([]byte, gcm.NonceSize()) // 12 bytes
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+
+	sealed := gcm.Seal(nil, nonce, plaintext, nil)
+	result := make([]byte, len(nonce)+len(sealed))
+	copy(result[:len(nonce)], nonce)
+	copy(result[len(nonce):], sealed)
+	return result, nil
+}
+
+// decryptPacket decrypts a ciphertext produced by encryptPacket. It expects
+// the first 12 bytes to be the nonce.
+func (m *OverlayManager) decryptPacket(ciphertext []byte, sharedKey []byte) ([]byte, error) {
+	block, err := aes.NewCipher(sharedKey)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	nonceSize := gcm.NonceSize() // 12 bytes
+	if len(ciphertext) < nonceSize {
+		return nil, fmt.Errorf("ciphertext too short: %d bytes", len(ciphertext))
+	}
+
+	nonce := ciphertext[:nonceSize]
+	sealed := ciphertext[nonceSize:]
+	return gcm.Open(nil, nonce, sealed, nil)
+}
+
+
+// ---------------------------------------------------------------------------
+// TUN fd operations (overlay-only mode)
+// ---------------------------------------------------------------------------
+
+// tunReadLoop reads raw IP packets from the TUN file descriptor (passed from
+// Swift), routes them to the appropriate peer via the overlay transport.
+// This goroutine only runs in pure overlay mode; in hybrid mode mihomo owns
+// the TUN fd and routes overlay traffic through its p2p proxy outbounds.
+func (m *OverlayManager) tunReadLoop() {
+	buf := make([]byte, 65535)
+	for m.running.Load() {
+		n, err := syscall.Read(m.tunFd, buf)
+		if err != nil {
+			if m.running.Load() {
+				m.logf("[Overlay] TUN read error: %v", err)
+			}
+			return
+		}
+		if n < 20 {
+			continue // too short for IPv4 header
+		}
+
+		packet := make([]byte, n)
+		copy(packet, buf[:n])
+
+		// Parse destination IP (IPv4 only, bytes 16-19)
+		version := (packet[0] >> 4) & 0x0F
+		if version != 4 {
+			continue // skip non-IPv4 for now
+		}
+
+		dstIP := fmt.Sprintf("%d.%d.%d.%d", packet[16], packet[17], packet[18], packet[19])
+
+		// Skip loopback to self
+		m.mu.RLock()
+		localIP := m.overlayIP
+		m.mu.RUnlock()
+		if dstIP == localIP {
+			// Write back to TUN for local delivery
+			m.writeToTUN(packet)
+			continue
+		}
+
+		// Lookup peer by overlay IP
+		m.mu.RLock()
+		peerID, ok := m.routes[dstIP]
+		sharedKey, hasKey := m.peerKeys[peerID]
+		m.mu.RUnlock()
+
+		if !ok {
+			m.logf("[Overlay] No route to %s (local: %s)", dstIP, localIP)
+			continue
+		}
+		if !hasKey {
+			m.logf("[Overlay] No shared key for peer %s", peerID)
+			continue
+		}
+
+		// Encrypt
+		encrypted, err := m.encryptPacket(packet, sharedKey)
+		if err != nil {
+			m.logf("[Overlay] Failed to encrypt packet for %s: %v", dstIP, err)
+			continue
+		}
+
+		// Send via overlay transport
+		if err := globalOverlayTransport.Send(peerID, encrypted); err != nil {
+			m.logf("[Overlay] Failed to send to %s: %v", dstIP, err)
+		}
+	}
+}
+
+// writeToTUN writes a raw IP packet to the TUN file descriptor.
+func (m *OverlayManager) writeToTUN(packet []byte) error {
+	_, err := syscall.Write(m.tunFd, packet)
+	return err
+}
+
+// handleInboundPacket is called by the overlay transport when a packet
+// arrives from a peer. It decrypts the payload and writes the resulting IP
+// packet to the TUN fd.
+func (m *OverlayManager) handleInboundPacket(peerID string, payload []byte) {
+	if !m.running.Load() {
+		return
+	}
+
+	m.mu.RLock()
+	sharedKey, ok := m.peerKeys[peerID]
+	m.mu.RUnlock()
+
+	if !ok {
+		m.logf("[Overlay] No shared key for inbound packet from %s", peerID)
+		return
+	}
+
+	decrypted, err := m.decryptPacket(payload, sharedKey)
+	if err != nil {
+		m.logf("[Overlay] Failed to decrypt packet from %s: %v", peerID, err)
+		return
+	}
+
+	// Validate minimum IP packet size
+	if len(decrypted) < 20 {
+		m.logf("[Overlay] Received packet too short from %s: %d bytes", peerID, len(decrypted))
+		return
+	}
+
+	m.logf("[Overlay] Decrypted %d-byte packet from %s", len(decrypted), peerID)
+
+	// Write to TUN fd
+	if err := m.writeToTUN(decrypted); err != nil {
+		m.logf("[Overlay] Failed to write packet to TUN from %s: %v", peerID, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Control plane API
+// ---------------------------------------------------------------------------
+
+// register sends a POST /api/v1/overlay/register request to the control plane.
+func (m *OverlayManager) register() (*overlayRegisterResult, error) {
+	reqBody := overlayRegisterRequest{
+		PublicKey:  m.publicKeyBase64,
+		Platform:   m.config.Platform,
+		DeviceName: m.config.DeviceName,
+		Candidates: nil, // no candidates on initial registration
+	}
+
+	var result overlayRegisterResult
+	if err := m.sendRequest("POST", "api/v1/overlay/register", reqBody, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// fetchPeers sends a GET /api/v1/overlay/peers request.
+func (m *OverlayManager) fetchPeers() ([]overlayPeer, error) {
+	var resp overlayPeersResponse
+	if err := m.sendRequest("GET", "api/v1/overlay/peers", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Items, nil
+}
+
+// publishCandidates sends a POST /api/v1/overlay/candidates request with
+// retry logic (3 retries with exponential backoff), matching the Swift
+// publishWithRetry implementation.
+func (m *OverlayManager) publishCandidates(candidates []overlayCandidate, peerID string) error {
+	reqBody := publishCandidatesRequest{Candidates: candidates}
+	var lastErr error
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		err := m.sendRequest("POST", "api/v1/overlay/candidates", reqBody, nil)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < 3 {
+			m.logf("[Overlay] Publish failed (attempt %d/3) for peer %s, retrying in %ds: %v",
+				attempt, peerID, attempt, err)
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+	return fmt.Errorf("publish failed after 3 retries for peer %s: %w", peerID, lastErr)
+}
+
+// sendRequest is a generic HTTP helper that sends a request to the control
+// plane, parses the overlay envelope, checks success, and unmarshals the
+// response data.
+func (m *OverlayManager) sendRequest(method, path string, body interface{}, result interface{}) error {
+	var bodyReader io.Reader
+	if body != nil {
+		bodyBytes, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("marshal request body: %w", err)
+		}
+		bodyReader = strings.NewReader(string(bodyBytes))
+	}
+
+	url := strings.TrimRight(m.config.ServerURL, "/") + "/" + path
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+m.config.AccessToken)
+
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response body: %w", err)
+	}
+
+	var envelope overlayEnvelope
+	if err := json.Unmarshal(respBytes, &envelope); err != nil {
+		return fmt.Errorf("parse envelope: %w", err)
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg := envelope.Error
+		if msg == "" {
+			msg = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		return fmt.Errorf("server error: %s", msg)
+	}
+	if !envelope.Success {
+		return fmt.Errorf("server error: %s", envelope.Error)
+	}
+
+	// If result is nil, caller does not care about the response body.
+	if result == nil {
+		return nil
+	}
+
+	if len(envelope.Data) == 0 {
+		return fmt.Errorf("empty response data")
+	}
+	if err := json.Unmarshal(envelope.Data, result); err != nil {
+		return fmt.Errorf("unmarshal response data: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Route table
+// ---------------------------------------------------------------------------
+
+// buildRouteTable creates a mapping from overlay IP to peer device ID
+// and updates the per-peer crypto keys.
+func (m *OverlayManager) buildRouteTable() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.routes = make(map[string]string, len(m.peers))
+	for _, peer := range m.peers {
+		if peer.OverlayIP != "" {
+			m.routes[peer.OverlayIP] = peer.ID
+		}
+	}
+	m.logf("[Overlay] Route table built: %d entries", len(m.routes))
+}
+
+// ---------------------------------------------------------------------------
+// Signaling poll loop
+// ---------------------------------------------------------------------------
+
+// signalingLoop runs in a background goroutine, polling the control plane
+// for remote signaling every 5 seconds, with a full peer sync + route
+// refresh every 20 seconds (4th iteration).
+func (m *OverlayManager) signalingLoop() {
+	iteration := 0
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.cancelCh:
+			return
+		case <-ticker.C:
+			if !m.running.Load() {
+				return
+			}
+			m.pollRemoteSignaling()
+
+			iteration++
+			if iteration%4 == 0 {
+				m.refreshOverlayRuntime()
+			}
+		}
+	}
+}
+
+// pollRemoteSignaling fetches peers with their signaling candidates from
+// the control plane and injects SDPs and ICE candidates into the P2P
+// manager. This is a direct port of the Swift logic (~190 lines).
+func (m *OverlayManager) pollRemoteSignaling() {
+	peers, err := m.fetchPeers()
+	if err != nil {
+		m.logf("[Overlay] Signaling poll failed: %v", err)
+		return
+	}
+
+	m.mu.Lock()
+	myDeviceID := m.deviceID
+
+	for _, peer := range peers {
+		if len(peer.Candidates) == 0 {
+			continue
+		}
+
+		state := m.peerStates[peer.ID]
+
+		// Diagnostic logging
+		sdpCount := 0
+		iceCount := 0
+		for _, c := range peer.Candidates {
+			if c.IP == "sdp" {
+				sdpCount++
+			} else if c.IP == "candidate" {
+				iceCount++
+			}
+		}
+		m.logf("[Overlay] Fetched peer %s: %d candidates (sdp=%d, ice=%d), state=%s",
+			truncateID(peer.ID), len(peer.Candidates), sdpCount, iceCount, state)
+
+		// Separate SDP and ICE candidates
+		var sdpCandidates []overlayCandidate
+		var iceCandidates []overlayCandidate
+		for _, c := range peer.Candidates {
+			if c.IP == "sdp" {
+				sdpCandidates = append(sdpCandidates, c)
+			} else if c.IP == "candidate" {
+				iceCandidates = append(iceCandidates, c)
+			}
+		}
+
+		// Process SDPs first
+		isOfferer := myDeviceID < peer.ID
+		type latestSDPInfo struct {
+			candidate overlayCandidate
+			sigKey    string
+			sdpType   string
+		}
+		var latestSDP *latestSDPInfo
+
+		for _, candidate := range sdpCandidates {
+			if candidate.Type == "" {
+				continue
+			}
+
+			sigKey := fmt.Sprintf("%s:%d:%s", candidate.IP, candidate.Port, candidate.Type)
+			sdpType := "offer"
+			if candidate.Port == 1 {
+				sdpType = "answer"
+			}
+
+			// Skip SDPs of the wrong type for our role
+			if isOfferer && sdpType == "offer" {
+				m.markSeen(peer.ID, sigKey)
+				continue
+			}
+			if !isOfferer && sdpType == "answer" {
+				m.markSeen(peer.ID, sigKey)
+				continue
+			}
+
+			// Skip already-processed SDPs
+			if m.hasSeen(peer.ID, sigKey) {
+				continue
+			}
+
+			// If peer is in failed state, check for new session
+			currentState := m.peerStates[peer.ID]
+			if currentState == peerStateFailed {
+				newSessionID := extractSessionID(candidate.Type)
+				oldSessionID := m.peerSessionIDs[peer.ID]
+				if oldSessionID != "" && newSessionID == oldSessionID {
+					m.markSeen(peer.ID, sigKey)
+					continue
+				}
+				// New session detected — reset state
+				m.logf("[Overlay] New SDP session detected for %s, resetting from failed state", truncateID(peer.ID))
+				m.peerStates[peer.ID] = peerStateIdle
+				delete(m.failedPeers, peer.ID)
+				delete(m.peerUfrags, peer.ID)
+				delete(m.peerSessionIDs, peer.ID)
+				delete(m.seenCandidates, peer.ID)
+			}
+
+			latestSDP = &latestSDPInfo{
+				candidate: candidate,
+				sigKey:    sigKey,
+				sdpType:   sdpType,
+			}
+		}
+
+		if latestSDP != nil {
+			currentState := m.peerStates[peer.ID]
+
+			// Answerer in failed state receiving a new offer — recover
+			if currentState == peerStateFailed && !isOfferer && latestSDP.sdpType == "offer" {
+				m.logf("[Overlay] Received new offer from peer %s, clearing failed state", truncateID(peer.ID))
+				delete(m.peerSessionIDs, peer.ID)
+				delete(m.peerUfrags, peer.ID)
+				delete(m.failedPeers, peer.ID)
+				currentState = peerStateIdle
+			}
+
+			if currentState == peerStateConnected {
+				m.logf("[Overlay] Skipping new %s from %s, already connected", latestSDP.sdpType, truncateID(peer.ID))
+			} else if currentState == peerStateSDPReceived && isOfferer && latestSDP.sdpType == "answer" {
+				preview := truncateStr(latestSDP.candidate.Type, 120)
+				m.logf("[Overlay] Injecting remote sdp (%s) from peer %s, len=%d, preview: %s",
+					latestSDP.sdpType, peer.ID, len(latestSDP.candidate.Type), preview)
+
+				msg := P2PSignalingMessage{Type: "sdp", Payload: latestSDP.candidate.Type, SDPType: latestSDP.sdpType}
+				if sigJSON, err := json.Marshal(msg); err == nil {
+					if injErr := AddP2PPeer(peer.ID, string(sigJSON)); injErr != nil {
+						m.logf("[Overlay] Failed to inject SDP: %v", injErr)
+						m.peerStates[peer.ID] = peerStateFailed
+						m.failedPeers[peer.ID] = true
+					} else {
+						m.markSeen(peer.ID, latestSDP.sigKey)
+						m.peerUfrags[peer.ID] = extractUfrag(latestSDP.candidate.Type)
+						if sid := extractSessionID(latestSDP.candidate.Type); sid != "" {
+							m.peerSessionIDs[peer.ID] = sid
+						}
+					}
+				}
+			} else if currentState == peerStateSDPReceived {
+				m.logf("[Overlay] Skipping new %s from %s, SDP already in progress (%s)",
+					latestSDP.sdpType, truncateID(peer.ID), currentState)
+				m.markSeen(peer.ID, latestSDP.sigKey)
+			} else if currentState == peerStateFailed {
+				m.logf("[Overlay] Skipping %s from %s, peer connection failed (traffic will use relay)",
+					latestSDP.sdpType, truncateID(peer.ID))
+				m.markSeen(peer.ID, latestSDP.sigKey)
+			} else {
+				// State is idle — safe to inject
+				preview := truncateStr(latestSDP.candidate.Type, 120)
+				m.logf("[Overlay] Injecting remote sdp (%s) from peer %s, len=%d, preview: %s",
+					latestSDP.sdpType, peer.ID, len(latestSDP.candidate.Type), preview)
+
+				msg := P2PSignalingMessage{Type: "sdp", Payload: latestSDP.candidate.Type, SDPType: latestSDP.sdpType}
+				if sigJSON, err := json.Marshal(msg); err == nil {
+					if injErr := AddP2PPeer(peer.ID, string(sigJSON)); injErr != nil {
+						m.logf("[Overlay] Failed to inject SDP: %v", injErr)
+						m.peerStates[peer.ID] = peerStateFailed
+						m.failedPeers[peer.ID] = true
+					} else {
+						m.markSeen(peer.ID, latestSDP.sigKey)
+						m.peerStates[peer.ID] = peerStateSDPReceived
+						m.peerUfrags[peer.ID] = extractUfrag(latestSDP.candidate.Type)
+						if sid := extractSessionID(latestSDP.candidate.Type); sid != "" {
+							m.peerSessionIDs[peer.ID] = sid
+						}
+					}
+				}
+			}
+		}
+
+		// Only inject ICE candidates after SDP has been set
+		if m.peerStates[peer.ID] != peerStateSDPReceived && m.peerStates[peer.ID] != peerStateConnected {
+			continue
+		}
+		currentUfrag, hasUfrag := m.peerUfrags[peer.ID]
+		if !hasUfrag {
+			continue
+		}
+
+		for _, candidate := range iceCandidates {
+			if candidate.Type == "" {
+				continue
+			}
+
+			sigKey := fmt.Sprintf("%s:%d:%s", candidate.IP, candidate.Port, candidate.Type)
+			if m.hasSeen(peer.ID, sigKey) {
+				continue
+			}
+
+			// Filter stale candidates from previous connection attempts
+			if !strings.Contains(candidate.Type, "ufrag "+currentUfrag) {
+				m.markSeen(peer.ID, sigKey)
+				continue
+			}
+
+			preview := truncateStr(candidate.Type, 120)
+			m.logf("[Overlay] Injecting remote candidate (ice) from peer %s, len=%d, preview: %s",
+				peer.ID, len(candidate.Type), preview)
+
+			msg := P2PSignalingMessage{Type: "candidate", Payload: candidate.Type}
+			if sigJSON, err := json.Marshal(msg); err == nil {
+				if injErr := AddP2PPeer(peer.ID, string(sigJSON)); injErr != nil {
+					m.logf("[Overlay] Failed to inject ICE candidate: %v", injErr)
+				}
+				m.markSeen(peer.ID, sigKey)
+			}
+		}
+	}
+	m.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// P2P offer initiation
+// ---------------------------------------------------------------------------
+
+// initiateP2POffers iterates over all known peers where we are the offerer
+// (myDeviceID < peerID) and initiates WebRTC offers for peers that haven't
+// been offered yet or have failed and need a retry.
+func (m *OverlayManager) initiateP2POffers() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	myDeviceID := m.deviceID
+
+	for _, peer := range m.peers {
+		state := m.peerStates[peer.ID]
+
+		// Skip connected or in-progress peers
+		if state == peerStateConnected || state == peerStateSDPReceived {
+			continue
+		}
+
+		// Skip if already offered (unless failed, which allows retry)
+		if m.offeredPeers[peer.ID] && state != peerStateFailed {
+			continue
+		}
+
+		if myDeviceID < peer.ID {
+			// We are the offerer
+			if state == peerStateFailed {
+				// Clear stale tracking for retry
+				delete(m.peerSessionIDs, peer.ID)
+				delete(m.peerUfrags, peer.ID)
+				delete(m.failedPeers, peer.ID)
+			} else {
+				// Fresh start: purge stale candidates from server
+				if len(peer.Candidates) > 0 {
+					m.logf("[Overlay] Purging %d stale candidates for peer %s...",
+						len(peer.Candidates), peer.ID)
+					for _, c := range peer.Candidates {
+						sigKey := fmt.Sprintf("%s:%d:%s", c.IP, c.Port, c.Type)
+						m.markSeen(peer.ID, sigKey)
+					}
+				}
+			}
+
+			m.logf("[Overlay] Initiating P2P offer for peer %s (we are offerer)", peer.ID)
+			if err := StartP2POffer(peer.ID); err != nil {
+				m.logf("[Overlay] Failed to start P2P offer for %s: %v", peer.ID, err)
+			} else {
+				m.offeredPeers[peer.ID] = true
+				m.peerStates[peer.ID] = peerStateSDPReceived
+			}
+		} else {
+			m.logf("[Overlay] Waiting for P2P offer from peer %s (they are offerer)", peer.ID)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Refresh overlay runtime (full peer sync)
+// ---------------------------------------------------------------------------
+
+// refreshOverlayRuntime performs a full peer sync: publishes empty
+// candidates as keep-alive, fetches the latest peer list, updates routes
+// and keys, prunes stale state for removed peers, and re-initiates P2P
+// offers. Called every 20 seconds from the signaling loop.
+func (m *OverlayManager) refreshOverlayRuntime() {
+	// Publish empty candidates (keep-alive)
+	if err := m.publishCandidates(nil, ""); err != nil {
+		m.logf("[Overlay] Keep-alive publish failed: %v", err)
+	}
+
+	// Fetch peers
+	peers, err := m.fetchPeers()
+	if err != nil {
+		m.logf("[Overlay] Peer refresh failed: %v", err)
+		return
+	}
+
+	m.mu.Lock()
+	m.peers = peers
+	newPeerIDs := make(map[string]bool, len(peers))
+	for _, p := range peers {
+		newPeerIDs[p.ID] = true
+	}
+
+	// Detect peer list changes
+	if !mapsEqual(m.knownPeerIDs, newPeerIDs) {
+		m.logf("[Overlay] Peer list changed: %d -> %d peers",
+			len(m.knownPeerIDs), len(newPeerIDs))
+		m.pruneOverlayState(newPeerIDs)
+		m.knownPeerIDs = newPeerIDs
+	}
+	m.mu.Unlock()
+
+	// Update routes and keys
+	m.buildRouteTable()
+	m.deriveAllPeerKeys()
+
+	// Re-initiate P2P offers
+	m.initiateP2POffers()
+}
+
+// pruneOverlayState removes signaling state for peers that are no longer in
+// the active peer list.
+func (m *OverlayManager) pruneOverlayState(validPeerIDs map[string]bool) {
+	for id := range m.seenCandidates {
+		if !validPeerIDs[id] {
+			delete(m.seenCandidates, id)
+		}
+	}
+	for id := range m.peerStates {
+		if !validPeerIDs[id] {
+			delete(m.peerStates, id)
+		}
+	}
+	for id := range m.peerUfrags {
+		if !validPeerIDs[id] {
+			delete(m.peerUfrags, id)
+		}
+	}
+	for id := range m.peerSessionIDs {
+		if !validPeerIDs[id] {
+			delete(m.peerSessionIDs, id)
+		}
+	}
+	for id := range m.offeredPeers {
+		if !validPeerIDs[id] {
+			delete(m.offeredPeers, id)
+		}
+	}
+	for id := range m.failedPeers {
+		if !validPeerIDs[id] {
+			delete(m.failedPeers, id)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// P2P callback wiring
+// ---------------------------------------------------------------------------
+
+// wireP2PCallbacks replaces the Swift round-trip callbacks on the p2p.Manager
+// with direct Go handlers that publish signaling to the control plane server
+// and handle connection state transitions internally.  It also wraps the
+// overlay transport's platform so that inbound packets are decrypted and
+// written to the TUN fd instead of being forwarded to Swift.
+func (m *OverlayManager) wireP2PCallbacks() {
+	mgr := p2p.GetManager()
+
+	mgr.Mu.Lock()
+	mgr.OnLocalDescription = func(peerID string, sdp string, sdpType string) {
+		m.logf("[Overlay] Publishing local sdp (%s) for peer %s, payload len=%d",
+			sdpType, truncateID(peerID), len(sdp))
+		// Encode SDP type in port field: 0=offer, 1=answer
+		port := 0
+		if sdpType == "answer" {
+			port = 1
+		}
+		candidate := overlayCandidate{
+			IP:   "sdp",
+			Port: port,
+			Type: sdp,
+		}
+		if err := m.publishCandidates([]overlayCandidate{candidate}, peerID); err != nil {
+			m.logf("[Overlay] Failed to publish local SDP: %v", err)
+		}
+	}
+	mgr.OnLocalCandidate = func(peerID string, candidate string) {
+		cand := overlayCandidate{
+			IP:   "candidate",
+			Port: 0,
+			Type: candidate,
+		}
+		if err := m.publishCandidates([]overlayCandidate{cand}, peerID); err != nil {
+			m.logf("[Overlay] Failed to publish local ICE candidate: %v", err)
+		}
+	}
+	mgr.OnConnectionStateChange = func(peerID string, state string) {
+		m.logf("[Overlay] P2P connection state for %s: %s", truncateID(peerID), state)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		currentState := m.peerStates[peerID]
+
+		switch state {
+		case "connected":
+			m.peerStates[peerID] = peerStateConnected
+			delete(m.failedPeers, peerID)
+		case "connecting":
+			// Don't change state if already tracking as sdpReceived
+		case "disconnected":
+			m.logf("[Overlay] P2P disconnected for %s, waiting for recovery...", truncateID(peerID))
+		case "failed":
+			m.peerStates[peerID] = peerStateFailed
+			m.failedPeers[peerID] = true
+			m.logf("[Overlay] P2P failed for %s, traffic will relay via VPS", truncateID(peerID))
+		case "closed":
+			if currentState == peerStateSDPReceived || currentState == peerStateIdle || currentState == peerStateFailed {
+				m.logf("[Overlay] Ignoring stale 'closed' callback for %s (current state: %s)",
+					truncateID(peerID), currentState)
+			} else {
+				m.peerStates[peerID] = peerStateFailed
+				m.failedPeers[peerID] = true
+				m.logf("[Overlay] P2P closed for %s, traffic will relay via VPS", truncateID(peerID))
+			}
+		}
+	}
+	mgr.Mu.Unlock()
+
+	// Set the packet handler on the overlay transport so that inbound
+	// packets are handled directly in Go (decrypt + write to TUN).
+	globalOverlayTransport.SetPacketHandler(func(peerID string, payload []byte) {
+		m.handleInboundPacket(peerID, payload)
+	})
+}
+
+// ---------------------------------------------------------------------------
+// ICE server configuration
+// ---------------------------------------------------------------------------
+
+// configureICEServers sets up public STUN servers for WebRTC NAT discovery.
+func (m *OverlayManager) configureICEServers() {
+	iceConfig := `[` +
+		`{"urls":["stun:stun.miwifi.com:3478"]},` +
+		`{"urls":["stun:stun.qq.com:3478"]},` +
+		`{"urls":["stun:stun.aliyun.com:3478"]}` +
+		`]`
+
+	if err := SetICEServersJSON(iceConfig); err != nil {
+		m.logf("[Overlay] Failed to configure ICE servers: %v", err)
+	} else {
+		m.logf("[Overlay] ICE servers configured")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid YAML injection
+// ---------------------------------------------------------------------------
+
+// injectHybridYAML reads the base proxy YAML and injects p2p outbound
+// entries and an overlay proxy-group, matching the Swift startHybrid logic.
+func (m *OverlayManager) injectHybridYAML() error {
+	m.mu.RLock()
+	hybridConfigPath := m.config.HybridConfigPath
+	peers := m.peers
+	deviceID := m.deviceID
+	accessToken := m.config.AccessToken
+	serverURL := m.config.ServerURL
+	m.mu.RUnlock()
+
+	if hybridConfigPath == "" {
+		return fmt.Errorf("hybrid config path not set")
+	}
+
+	// Read existing YAML
+	yamlBytes, err := os.ReadFile(hybridConfigPath)
+	if err != nil {
+		return fmt.Errorf("read hybrid config: %w", err)
+	}
+	proxyYaml := string(yamlBytes)
+
+	// Resolve relay endpoint for YAML injection
+	// Fetch from registration result (use the relay endpoint from the transport)
+	relayEndpoint := ""
+	if m.httpClient != nil {
+		// Try to get it from a fresh registration
+		regResult, err := m.register()
+		if err == nil {
+			relayEndpoint = resolveRelayEndpoint(regResult.RelayEndpoint, serverURL)
+		}
+	}
+	if relayEndpoint == "" {
+		relayEndpoint = resolveRelayEndpoint("", serverURL)
+	}
+
+	// Build p2p outbound entries
+	var p2pBlock strings.Builder
+	for _, peer := range peers {
+		p2pBlock.WriteString("\n")
+		p2pBlock.WriteString(fmt.Sprintf("- name: \"p2p-%s\"\n", truncateID(peer.ID)))
+		p2pBlock.WriteString("  type: p2p\n")
+		p2pBlock.WriteString(fmt.Sprintf("  peer-id: \"%s\"\n", peer.ID))
+		p2pBlock.WriteString(fmt.Sprintf("  local-device-id: \"%s\"\n", deviceID))
+		p2pBlock.WriteString(fmt.Sprintf("  relay-endpoint: \"%s\"\n", relayEndpoint))
+		p2pBlock.WriteString(fmt.Sprintf("  access-token: \"%s\"\n", accessToken))
+	}
+
+	// Build overlay proxy-group
+	var overlayProxies strings.Builder
+	if len(peers) == 0 {
+		overlayProxies.WriteString("  - DIRECT")
+	} else {
+		for i, peer := range peers {
+			if i > 0 {
+				overlayProxies.WriteString("\n")
+			}
+			overlayProxies.WriteString(fmt.Sprintf("  - \"p2p-%s\"", truncateID(peer.ID)))
+		}
+	}
+
+	overlayGroupBlock := "\n" +
+		"- name: overlay\n" +
+		"  type: fallback\n" +
+		"  proxies:\n" +
+		overlayProxies.String() + "\n\n"
+
+	// Insert p2p entries before proxy-groups:
+	if idx := strings.Index(proxyYaml, "\nproxy-groups:"); idx >= 0 {
+		proxyYaml = proxyYaml[:idx] + p2pBlock.String() + proxyYaml[idx:]
+	}
+
+	// Insert overlay group before rule-providers: (or rules: as fallback)
+	if idx := strings.Index(proxyYaml, "\nrule-providers:"); idx >= 0 {
+		proxyYaml = proxyYaml[:idx] + overlayGroupBlock + proxyYaml[idx:]
+	} else if idx := strings.Index(proxyYaml, "\nrules:"); idx >= 0 {
+		proxyYaml = proxyYaml[:idx] + overlayGroupBlock + proxyYaml[idx:]
+	}
+
+	// Write back
+	if err := os.WriteFile(hybridConfigPath, []byte(proxyYaml), 0644); err != nil {
+		return fmt.Errorf("write hybrid config: %w", err)
+	}
+
+	m.logf("[Overlay] Hybrid config written with %d p2p peers", len(peers))
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+// logf logs a message via the platform interface if available, or to stderr.
+func (m *OverlayManager) logf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if m.platform != nil {
+		m.platform.WriteLog(msg)
+		return
+	}
+	fmt.Fprintln(os.Stderr, msg)
+}
+
+// markSeen records a signaling key as seen for a peer. Caller must hold m.mu.
+func (m *OverlayManager) markSeen(peerID, sigKey string) {
+	if m.seenCandidates[peerID] == nil {
+		m.seenCandidates[peerID] = make(map[string]bool)
+	}
+	m.seenCandidates[peerID][sigKey] = true
+}
+
+// hasSeen checks if a signaling key has been seen for a peer. Caller must hold m.mu.
+func (m *OverlayManager) hasSeen(peerID, sigKey string) bool {
+	return m.seenCandidates[peerID][sigKey]
+}
+
+// extractUfrag extracts the a=ice-ufrag: value from an SDP string.
+func extractUfrag(sdp string) string {
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "a=ice-ufrag:") {
+			return strings.TrimSpace(line[len("a=ice-ufrag:"):])
+		}
+	}
+	return ""
+}
+
+// extractSessionID extracts the session ID from the o=- line of an SDP.
+// Format: o=- <session-id> <version> IN IP4 <address>
+func extractSessionID(sdp string) string {
+	for _, line := range strings.Split(sdp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "o=- ") {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				return parts[1]
+			}
+		}
+	}
+	return ""
+}
+
+// resolveRelayEndpoint resolves the relay endpoint: if it starts with ":",
+// prepend the server host.
+func resolveRelayEndpoint(endpoint, serverURL string) string {
+	if strings.HasPrefix(endpoint, ":") {
+		// Parse host from server URL
+		serverURL = strings.TrimRight(serverURL, "/")
+		// Remove scheme
+		if idx := strings.Index(serverURL, "://"); idx >= 0 {
+			serverURL = serverURL[idx+3:]
+		}
+		// Remove path
+		if idx := strings.Index(serverURL, "/"); idx >= 0 {
+			serverURL = serverURL[:idx]
+		}
+		// Remove port
+		if idx := strings.LastIndex(serverURL, ":"); idx >= 0 {
+			// Only remove if it looks like a port (all digits after)
+			portStr := serverURL[idx+1:]
+			allDigits := true
+			for _, c := range portStr {
+				if c < '0' || c > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				serverURL = serverURL[:idx]
+			}
+		}
+		return serverURL + endpoint
+	}
+	return endpoint
+}
+
+// truncateID returns a short prefix of a device/peer ID for log messages.
+func truncateID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
+// truncateStr returns at most maxLen characters of s, appending "..." if truncated.
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+// mapsEqual checks if two string->bool maps have the same keys.
+func mapsEqual(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
+}

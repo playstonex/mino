@@ -22,11 +22,10 @@ type PlatformInterface interface {
 	ClearDNSCache()
 	SendNotification(notification *Notification) error
 
-	// P2P Signaling
-	OnLocalDescription(peerID string, sdp string, sdpType string)
-	OnLocalCandidate(peerID string, candidate string)
-	OnP2PConnectionStateChange(peerID string, state string)
-	OnOverlayPacket(peerID string, payload []byte)
+	// Overlay state change callback (replaces individual P2P callbacks).
+	// The overlay manager handles all P2P signaling internally and sends
+	// consolidated state updates via this single callback for UI display.
+	OnOverlayStateChange(stateJSON string)
 }
 type TunInterface interface {
 	FileDescriptor() int32

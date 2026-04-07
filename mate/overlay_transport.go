@@ -22,6 +22,11 @@ type overlayTransportManager struct {
 	peers       map[string]struct{}
 
 	packetConns map[string]net.PacketConn
+
+	// packetHandler is called by dispatchPacket when set.
+	// The overlay manager sets this to handle decrypt + TUN write internally,
+	// replacing the old Swift callback (OnOverlayPacket).
+	packetHandler func(peerID string, payload []byte)
 }
 
 func newOverlayTransportManager() *overlayTransportManager {
@@ -50,12 +55,20 @@ func (m *overlayTransportManager) Reset() {
 	m.accessToken = ""
 	m.localDeviceID = ""
 	m.peers = make(map[string]struct{})
+	m.packetHandler = nil
 }
 
 func (m *overlayTransportManager) SetPlatform(platform PlatformInterface) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.platform = platform
+}
+
+// SetPacketHandler sets the callback for handling received overlay packets.
+func (m *overlayTransportManager) SetPacketHandler(handler func(peerID string, payload []byte)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.packetHandler = handler
 }
 
 func (m *overlayTransportManager) logf(format string, args ...any) {
@@ -231,15 +244,13 @@ func (m *overlayTransportManager) readLoop(peerID string, conn net.PacketConn) {
 
 func (m *overlayTransportManager) dispatchPacket(peerID string, payload []byte) {
 	m.mu.RLock()
-	platform := m.platform
+	handler := m.packetHandler
 	m.mu.RUnlock()
 
-	if platform == nil {
-		return
+	if handler != nil {
+		m.logf("[OverlayTransport] received %d bytes from %s", len(payload), peerID)
+		handler(peerID, payload)
 	}
-
-	m.logf("[OverlayTransport] received %d bytes from %s", len(payload), peerID)
-	platform.OnOverlayPacket(peerID, payload)
 }
 
 func ConfigureOverlayTransport(relayEndpoint string, accessToken string, localDeviceID string) error {

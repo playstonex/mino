@@ -20,6 +20,7 @@ func Say(name string) string {
 }
 
 var globalService *MihomoService
+var globalOverlayManager = NewOverlayManager()
 
 type ServerConfig struct {
 	ConfigPath string
@@ -61,16 +62,8 @@ func Start(config *ServerConfig, platformInterface PlatformInterface) error {
 	m := p2p.GetManager()
 	m.Reset()
 
-	// Register P2P signaling callbacks
-	m.OnLocalDescription = func(peerID string, sdp string, sdpType string) {
-		platformInterface.OnLocalDescription(peerID, sdp, sdpType)
-	}
-	m.OnLocalCandidate = func(peerID string, candidate string) {
-		platformInterface.OnLocalCandidate(peerID, candidate)
-	}
-	m.OnConnectionStateChange = func(peerID string, state string) {
-		platformInterface.OnP2PConnectionStateChange(peerID, state)
-	}
+	// P2P signaling callbacks are wired by the overlay manager when active.
+	// In proxy-only mode, no P2P callbacks are needed.
 
 	SetTunCreator(globalService.plantformWrapper)
 	return globalService.Start()
@@ -160,6 +153,36 @@ func MonitorSnapshotJSON() string {
 		return "{}"
 	}
 	return string(data)
+}
+
+// ---------------------------------------------------------------------------
+// Overlay (gomobile-exported)
+// ---------------------------------------------------------------------------
+
+// MateStartOverlay starts the overlay stack in standalone mode (virtual LAN only).
+// Go handles: registration, signaling, encryption, packet routing.
+// Swift must call applyOverlayNetworkSettings() before this.
+func StartOverlay(configJSON string, platformInterface PlatformInterface) error {
+	return globalOverlayManager.Start(configJSON, platformInterface)
+}
+
+// MateStartHybrid starts mihomo in hybrid mode (proxy + virtual LAN).
+// Go handles: read base YAML, inject p2p entries, registration,
+// signaling, encryption, packet routing, ICE server config.
+// Swift must call applyOverlayNetworkSettings() before this.
+func StartHybrid(configJSON string, platformInterface PlatformInterface) error {
+	return globalOverlayManager.Start(configJSON, platformInterface)
+}
+
+// MateStopOverlay stops the overlay manager gracefully.
+func StopOverlay() error {
+	return globalOverlayManager.Stop()
+}
+
+// MateGetOverlaySnapshotJSON returns the current overlay state for UI display.
+// The returned JSON matches Swift's OverlaySnapshot schema exactly.
+func GetOverlaySnapshotJSON() string {
+	return globalOverlayManager.SnapshotJSON()
 }
 
 // func Version() string {
