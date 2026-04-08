@@ -145,6 +145,14 @@ func (m *overlayTransportManager) AttachPeerPacketConn(peerID string, conn net.P
 	go m.readLoop(peerID, conn)
 }
 
+// HasPacketConn returns true if a direct packet channel is registered for the peer.
+func (m *overlayTransportManager) HasPacketConn(peerID string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.packetConns[peerID]
+	return ok
+}
+
 func (m *overlayTransportManager) Send(peerID string, payload []byte) error {
 	if err := m.RegisterPeer(peerID); err != nil {
 		return err

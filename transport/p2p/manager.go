@@ -157,6 +157,12 @@ func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
 			m.logf("[P2P] peer %s: ICE gathering complete", peerID)
 			return
 		}
+		// Filter out overlay/tunnel interface candidates that can never
+		// reach the remote peer and only waste ICE connectivity checks.
+		if shouldFilterCandidateAddr(c.Address) {
+			m.logf("[P2P] peer %s: filtered tunnel candidate %s", peerID, c.Address)
+			return
+		}
 		m.logf("[P2P] peer %s: local ICE candidate: %s", peerID, c.ToJSON().Candidate)
 		if m.OnLocalCandidate != nil {
 			m.OnLocalCandidate(peerID, c.ToJSON().Candidate)
@@ -428,6 +434,61 @@ func (c *DataChannelConn) RemoteAddr() net.Addr {
 func (c *DataChannelConn) SetDeadline(t time.Time) error      { return nil }
 func (c *DataChannelConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *DataChannelConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// shouldFilterCandidateAddr returns true for IP addresses that belong to
+// overlay/tunnel interfaces and can never be reached by a remote peer.
+// Filtering these prevents wasted ICE connectivity checks and reduces the
+// candidate set to addresses that have a chance of working.
+func shouldFilterCandidateAddr(addr string) bool {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+
+	// --- IPv4 ranges ---
+	if ip4 := ip.To4(); ip4 != nil {
+		// 100.64.0.0/10 — CGNAT / overlay virtual IP range (e.g. 100.96.x.x)
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return true
+		}
+		// 198.18.0.0/15 — mihomo TUN interface addresses
+		if ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19) {
+			return true
+		}
+		// 192.0.0.0/24 — IANA reserved, used by various tunnel interfaces
+		if ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0 {
+			return true
+		}
+	}
+
+	// --- IPv6 ranges ---
+	if len(ip) == net.IPv6len {
+		// fd74:6572:6d6e:7573::/64 — mihomo internal overlay IPv6 ("termnus")
+		if ip[0] == 0xfd && ip[1] == 0x74 && ip[2] == 0x65 && ip[3] == 0x72 &&
+			ip[4] == 0x6d && ip[5] == 0x6e && ip[6] == 0x75 && ip[7] == 0x73 {
+			return true
+		}
+		// fdfe:dcba:9876::/48 — mihomo TUN IPv6
+		if ip[0] == 0xfd && ip[1] == 0xfe && ip[2] == 0xdc && ip[3] == 0xba {
+			return true
+		}
+	}
+
+	return false
+}
+
+// FilteredICECandidate checks whether a raw ICE candidate string (as received
+// from signaling) carries an address that should be filtered. Returns true if
+// the candidate should be dropped.
+func FilteredICECandidate(candidateStr string) bool {
+	// candidate:<foundation> <component-id> <transport> <priority> <address> <port> ...
+	parts := strings.Fields(candidateStr)
+	if len(parts) < 5 {
+		return false
+	}
+	// Address is the 5th space-separated token.
+	return shouldFilterCandidateAddr(parts[4])
+}
 
 // PacketDataChannelConn implements net.PacketConn over a WebRTC DataChannel (datagram mode).
 // Suitable for transporting IP packets where each DataChannel message is one packet.

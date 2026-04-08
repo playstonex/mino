@@ -159,6 +159,9 @@ func StartP2POffer(peerID string) error {
 	dc.OnOpen(func() {
 		m.RegisterPacketConn(peerID, packetConn)
 		globalOverlayTransport.AttachPeerPacketConn(peerID, packetConn)
+		if m.Logger != nil {
+			m.Logger("[P2P] DataChannel 'mate-overlay' OPEN for offerer peer %s", truncateID(peerID))
+		}
 	})
 
 	offer, err := pc.CreateOffer(nil)
@@ -204,6 +207,9 @@ func setupDataChannelListener(peerID string, pc *webrtc.PeerConnection) {
 			dc.OnOpen(func() {
 				m.RegisterPacketConn(peerID, packetConn)
 				globalOverlayTransport.AttachPeerPacketConn(peerID, packetConn)
+				if m.Logger != nil {
+					m.Logger("[P2P] DataChannel 'mate-overlay' OPEN for answerer peer %s", truncateID(peerID))
+				}
 			})
 			return
 		}
