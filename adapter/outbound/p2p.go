@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -35,6 +36,12 @@ var (
 	relayMu     sync.Mutex
 	relayClient *p2p.RelayClient
 	relayOnce   sync.Once // ensures only one goroutine creates the relay
+
+	// relayReceivers maps peerID -> list of active relayPacketConns waiting
+	// for inbound data. When the relay's receive handler fires, it fans out
+	// to all registered receivers for that peer.
+	relayReceivers   = make(map[string][]*relayPacketConn)
+	relayReceiversMu sync.Mutex
 )
 
 // StreamConn is used when the proxy wraps another connection.
@@ -137,12 +144,11 @@ func (p *P2P) getPacketConn(ctx context.Context) (net.PacketConn, error) {
 func (p *P2P) getRelayPacketConn(ctx context.Context) (net.PacketConn, error) {
 	relayMu.Lock()
 
-	// If relay already connected, return the wrapped conn.
+	// If relay already connected, return a new receiver conn.
 	if relayClient != nil {
 		relayMu.Unlock()
-		// Ensure this peer is registered.
 		relayClient.AddPeer(p.peerID)
-		return &relayPacketConn{peerID: p.peerID}, nil
+		return newRelayPacketConn(p.peerID), nil
 	}
 
 	// If relay not yet initialized, create it.
@@ -155,28 +161,37 @@ func (p *P2P) getRelayPacketConn(ctx context.Context) (net.PacketConn, error) {
 	// Release lock during potentially slow network operations.
 	relayMu.Unlock()
 
-	fmt.Printf("[P2P Relay] Attempting relay connection for device %s to %s\n", p.localDeviceID, p.relayEndpoint)
 	rc, err := p2p.NewRelayClient(p.relayEndpoint, p.accessToken, p.localDeviceID)
 	if err != nil {
-		fmt.Printf("[P2P Relay] Relay connection failed for device %s: %v\n", p.localDeviceID, err)
 		return nil, fmt.Errorf("P2P relay connect: %w", err)
 	}
 
-	fmt.Printf("[P2P Relay] Successfully connected relay for device %s\n", p.localDeviceID)
-
 	// Re-acquire lock to set global relayClient.
 	relayMu.Lock()
-	// Double-check: another goroutine might have initialized it while we were connecting.
 	if relayClient == nil {
+		// Wire up the receive handler to fan out to registered receivers.
+		rc.SetReceiveHandler(func(peerID string, data []byte) {
+			relayReceiversMu.Lock()
+			receivers := relayReceivers[peerID]
+			relayReceiversMu.Unlock()
+			for _, r := range receivers {
+				// Non-blocking send — drop if receiver is full.
+				dataCopy := make([]byte, len(data))
+				copy(dataCopy, data)
+				select {
+				case r.recvCh <- dataCopy:
+				default:
+				}
+			}
+		})
 		relayClient = rc
 	} else {
-		// Another goroutine already set it, close our duplicate connection.
 		rc.Close()
 	}
 	relayClient.AddPeer(p.peerID)
 	relayMu.Unlock()
 
-	return &relayPacketConn{peerID: p.peerID}, nil
+	return newRelayPacketConn(p.peerID), nil
 }
 
 func (p *P2P) Close() error {
@@ -185,6 +200,7 @@ func (p *P2P) Close() error {
 	if relayClient != nil {
 		relayClient.Close()
 		relayClient = nil
+		relayOnce = sync.Once{} // allow re-creation on next Start
 	}
 	return nil
 }
@@ -239,15 +255,35 @@ func NewP2P(option P2POption) (*P2P, error) {
 }
 
 // relayPacketConn wraps the shared RelayClient as net.PacketConn for a specific peer.
+// Each instance has its own receive channel so ReadFrom actually returns data.
 type relayPacketConn struct {
-	peerID string
-	lAddr  net.Addr
+	peerID    string
+	recvCh    chan []byte
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newRelayPacketConn(peerID string) *relayPacketConn {
+	r := &relayPacketConn{
+		peerID: peerID,
+		recvCh: make(chan []byte, 256),
+		closed: make(chan struct{}),
+	}
+	// Register this conn to receive relay data for this peer.
+	relayReceiversMu.Lock()
+	relayReceivers[peerID] = append(relayReceivers[peerID], r)
+	relayReceiversMu.Unlock()
+	return r
 }
 
 func (r *relayPacketConn) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
-	// Inbound packets are delivered via the relay's receive handler directly
-	// to the tunnel. This ReadFrom blocks since the relay handles delivery.
-	select {}
+	select {
+	case <-r.closed:
+		return 0, nil, io.EOF
+	case data := <-r.recvCh:
+		n = copy(b, data)
+		return n, &net.UDPAddr{}, nil
+	}
 }
 
 func (r *relayPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
@@ -264,13 +300,26 @@ func (r *relayPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 }
 
 func (r *relayPacketConn) Close() error {
-	return nil // Shared relay is closed by P2P.Close()
+	r.closeOnce.Do(func() {
+		close(r.closed)
+		// Unregister from receivers.
+		relayReceiversMu.Lock()
+		receivers := relayReceivers[r.peerID]
+		for i, recv := range receivers {
+			if recv == r {
+				relayReceivers[r.peerID] = append(receivers[:i], receivers[i+1:]...)
+				break
+			}
+		}
+		if len(relayReceivers[r.peerID]) == 0 {
+			delete(relayReceivers, r.peerID)
+		}
+		relayReceiversMu.Unlock()
+	})
+	return nil
 }
 
 func (r *relayPacketConn) LocalAddr() net.Addr {
-	if r.lAddr != nil {
-		return r.lAddr
-	}
 	return &net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 0}
 }
 
