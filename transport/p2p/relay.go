@@ -220,7 +220,7 @@ func (r *RelayClient) receiveLoop() {
 }
 
 func (r *RelayClient) keepaliveLoop() {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
