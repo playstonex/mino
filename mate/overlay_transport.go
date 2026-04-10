@@ -160,11 +160,9 @@ func (m *overlayTransportManager) Send(peerID string, payload []byte) error {
 
 	if conn := m.packetConn(peerID); conn != nil {
 		if _, err := conn.WriteTo(payload, &net.UDPAddr{}); err == nil {
-			m.logf("[OverlayTransport] sent %d bytes to %s via direct p2p", len(payload), peerID)
 			return nil
-		} else {
-			m.logf("[OverlayTransport] direct send to %s failed, falling back to relay: %v", peerID, err)
 		}
+		// direct send failed, fall through to relay
 	}
 
 	relayClient, err := m.ensureRelay()
@@ -172,12 +170,7 @@ func (m *overlayTransportManager) Send(peerID string, payload []byte) error {
 		return err
 	}
 
-	if err := relayClient.SendToPeer(peerID, payload); err != nil {
-		return err
-	}
-
-	m.logf("[OverlayTransport] sent %d bytes to %s via relay", len(payload), peerID)
-	return nil
+	return relayClient.SendToPeer(peerID, payload)
 }
 
 func (m *overlayTransportManager) packetConn(peerID string) net.PacketConn {
@@ -256,7 +249,6 @@ func (m *overlayTransportManager) dispatchPacket(peerID string, payload []byte) 
 	m.mu.RUnlock()
 
 	if handler != nil {
-		m.logf("[OverlayTransport] received %d bytes from %s", len(payload), peerID)
 		handler(peerID, payload)
 	}
 }

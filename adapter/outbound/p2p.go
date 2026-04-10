@@ -34,6 +34,7 @@ type P2P struct {
 var (
 	relayMu     sync.Mutex
 	relayClient *p2p.RelayClient
+	relayOnce   sync.Once // ensures only one goroutine creates the relay
 )
 
 // StreamConn is used when the proxy wraps another connection.
@@ -216,13 +217,23 @@ func NewP2P(option P2POption) (*P2P, error) {
 		accessToken:   option.AccessToken,
 	}
 
-	// Background goroutine: Proactively connect relay to eliminate wait times
+	// Proactively connect relay once (not per-peer) to eliminate wait times
 	// if WebRTC (ICE) hole punching takes too long or fails.
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, _ = p.getRelayPacketConn(ctx)
-	}()
+	if p.relayEndpoint != "" && p.accessToken != "" && p.localDeviceID != "" {
+		go func() {
+			relayOnce.Do(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_, _ = p.getRelayPacketConn(ctx)
+			})
+			// Register this peer even if relay was already created by another P2P instance.
+			relayMu.Lock()
+			if relayClient != nil {
+				relayClient.AddPeer(p.peerID)
+			}
+			relayMu.Unlock()
+		}()
+	}
 
 	return p, nil
 }

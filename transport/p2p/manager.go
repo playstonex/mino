@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/webrtc/v4"
@@ -127,6 +129,7 @@ func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
 			{URLs: []string{"stun:stun.aliyun.com:3478"}},
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 			{URLs: []string{"stun:stun1.l.google.com:19302"}},
+			{URLs: []string{"turn:ctus.playstone.info:3478?transport=udp"}, Username: "bigbig", Credential: "123qwe"},
 		}
 	}
 
@@ -357,6 +360,7 @@ func NewDataChannelConn(dc *webrtc.DataChannel) *DataChannelConn {
 		closed: make(chan struct{}),
 	}
 
+	dropped := &atomic.Int64{}
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		data := make([]byte, len(msg.Data))
 		copy(data, msg.Data)
@@ -367,6 +371,11 @@ func NewDataChannelConn(dc *webrtc.DataChannel) *DataChannelConn {
 			case <-conn.closed:
 			case conn.readCh <- data:
 			default:
+				// Channel full — drop packet. For TCP streams this will
+				// trigger retransmission at the application layer.
+				if dropped.Add(1)%100 == 1 {
+					fmt.Fprintf(os.Stderr, "[DataChannelConn] readCh full, dropped packets (total: %d)\n", dropped.Load())
+				}
 			}
 		}
 	})
@@ -504,12 +513,13 @@ type PacketDataChannelConn struct {
 func NewPacketDataChannelConn(dc *webrtc.DataChannel) *PacketDataChannelConn {
 	conn := &PacketDataChannelConn{
 		dc:     dc,
-		msgCh:  make(chan packetMsg, 256),
+		msgCh:  make(chan packetMsg, 1024),
 		lAddr:  &net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 0},
 		rAddr:  &net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 0},
 		closed: make(chan struct{}),
 	}
 
+	dropped := &atomic.Int64{}
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		data := make([]byte, len(msg.Data))
 		copy(data, msg.Data)
@@ -520,6 +530,9 @@ func NewPacketDataChannelConn(dc *webrtc.DataChannel) *PacketDataChannelConn {
 			case <-conn.closed:
 			case conn.msgCh <- packetMsg{data: data, addr: conn.rAddr}:
 			default:
+				if dropped.Add(1)%100 == 1 {
+					fmt.Fprintf(os.Stderr, "[PacketDataChannelConn] msgCh full, dropped packets (total: %d)\n", dropped.Load())
+				}
 			}
 		}
 	})

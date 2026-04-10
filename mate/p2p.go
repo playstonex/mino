@@ -296,10 +296,8 @@ func setupDataChannelListener(peerID string, pc *webrtc.PeerConnection) {
 // gVisor's netstack (which cannot route loopback), and relays data
 // bidirectionally between the DataChannel and the local TCP service.
 func relayToLocalTCP(dcConn *p2p.DataChannelConn, host string, port int) {
-	fmt.Fprintf(os.Stderr, "[relayToLocalTCP] connecting to %s:%d\n", host, port)
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_TCP)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[relayToLocalTCP] syscall.Socket failed: %v\n", err)
 		dcConn.Close()
 		return
 	}
@@ -311,18 +309,15 @@ func relayToLocalTCP(dcConn *p2p.DataChannelConn, host string, port int) {
 
 	err = syscall.Connect(fd, addr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[relayToLocalTCP] syscall.Connect to %s:%d failed: %v\n", host, port, err)
 		dcConn.Close()
 		return
 	}
-	fmt.Fprintf(os.Stderr, "[relayToLocalTCP] connected to %s:%d, starting relay\n", host, port)
 
 	// net.FileConn dups the fd so we get a standard net.Conn.
 	file := os.NewFile(uintptr(fd), "")
 	tcpConn, err := net.FileConn(file)
 	file.Close()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[relayToLocalTCP] net.FileConn failed: %v\n", err)
 		dcConn.Close()
 		return
 	}
@@ -330,10 +325,8 @@ func relayToLocalTCP(dcConn *p2p.DataChannelConn, host string, port int) {
 
 	// Bidirectional relay: DataChannel <-> local TCP socket
 	go func() {
-		n, err := io.Copy(dcConn, tcpConn)
-		fmt.Fprintf(os.Stderr, "[relayToLocalTCP] dcConn<-tcpConn done: n=%d err=%v\n", n, err)
+		io.Copy(dcConn, tcpConn)
 		dcConn.Close()
 	}()
-	n, err := io.Copy(tcpConn, dcConn)
-	fmt.Fprintf(os.Stderr, "[relayToLocalTCP] tcpConn<-dcConn done: n=%d err=%v\n", n, err)
+	io.Copy(tcpConn, dcConn)
 }

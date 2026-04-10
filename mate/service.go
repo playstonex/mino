@@ -10,11 +10,24 @@ import (
 	"github.com/metacubex/mihomo/hub"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/tunnel"
 
 	tun "github.com/metacubex/sing-tun"
 
 	E "github.com/metacubex/sing/common/exceptions"
 )
+
+func init() {
+	// iOS Network Extension memory limit is ~50MB (iOS 17+), ~15MB (older).
+	// Cap Go heap to leave room for C/ObjC allocations and stack.
+	runtimeDebug.SetMemoryLimit(30 * 1024 * 1024) // 30 MB
+
+	// Limit OS threads — Network Extension has limited CPU budget.
+	runtime.GOMAXPROCS(3)
+
+	// More aggressive GC to stay within memory budget.
+	runtimeDebug.SetGCPercent(50)
+}
 
 type MihomoService struct {
 	ctx    context.Context
@@ -53,6 +66,56 @@ func (s *MihomoService) Start() error {
 func (s *MihomoService) Close() error {
 	s.cancel()
 	executor.Shutdown()
+	return nil
+}
+
+// ReloadConfig re-parses the config file at configPath and applies only
+// the proxy, rule, and provider configuration — without touching the TUN,
+// DNS server, or network listeners.
+//
+// This is called from the overlay manager after injecting p2p outbound
+// entries into the hybrid YAML.
+//
+// CRITICAL: We must NOT call hub.ApplyConfig or executor.ApplyConfig here.
+// Those functions call updateTun() which destroys and recreates the TUN
+// device.  Inside a Network Extension the TUN file descriptor is provided
+// by the OS (NEPacketTunnelProvider / NEPacketTunnelFlow).  Once destroyed,
+// a new TUN is disconnected from the OS packet flow — all proxy traffic
+// stops permanently.  The overlay injection only changes:
+//   - proxies  (adds p2p outbound entries)
+//   - proxy-groups  (adds overlay group)
+//   - rules  (adds overlay IP-CIDR rule)
+//
+// So we perform a targeted "light reload" that updates ONLY those parts.
+func (s *MihomoService) ReloadConfig(configPath string) error {
+	cfg, err := executor.ParseWithPath(configPath)
+	if err != nil {
+		return err
+	}
+
+	// Suspend the tunnel while we swap proxies and rules.
+	tunnel.OnSuspend()
+
+	// Replace proxy map (includes new p2p outbounds) and rule list.
+	tunnel.UpdateProxies(cfg.Proxies, cfg.Providers)
+	tunnel.UpdateRules(cfg.Rules, cfg.SubRules, cfg.RuleProviders)
+
+	tunnel.OnInnerLoading()
+
+	// Initialize providers so rule-sets can be fetched.
+	for _, pv := range cfg.Providers {
+		if initErr := pv.Initial(); initErr != nil {
+			log.Warnln("initial proxy provider %s error: %v", pv.Name(), initErr)
+		}
+	}
+	for _, pv := range cfg.RuleProviders {
+		if initErr := pv.Initial(); initErr != nil {
+			log.Warnln("initial rule provider %s error: %v", pv.Name(), initErr)
+		}
+	}
+
+	// Resume packet processing with the new config.
+	tunnel.OnRunning()
 	return nil
 }
 

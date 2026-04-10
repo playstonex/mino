@@ -6,8 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +23,25 @@ import (
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
+
+// ---------------------------------------------------------------------------
+// Buffer pools — reuse allocations on hot paths (TUN read/write, crypto)
+// ---------------------------------------------------------------------------
+
+// tunReadPool provides 65535-byte buffers for TUN fd reads.
+var tunReadPool = sync.Pool{
+	New: func() any { b := make([]byte, 65535); return &b },
+}
+
+// tunWritePool provides buffers for TUN fd writes (4-byte header + MTU).
+var tunWritePool = sync.Pool{
+	New: func() any { b := make([]byte, 4+65535); return &b },
+}
+
+// packetPool provides buffers for intermediate packet copies.
+var packetPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, 1600); return &b },
+}
 
 // ---------------------------------------------------------------------------
 // Config — parsed from JSON passed by Swift
@@ -146,7 +165,7 @@ const (
 	// p2pCooldownDuration is how long a peer stays in relay-only mode after
 	// reaching maxP2PFailures. This prevents resource-wasting retry loops
 	// when NAT traversal is impossible (e.g. both peers behind symmetric NAT).
-	p2pCooldownDuration = 5 * time.Minute
+	p2pCooldownDuration = 2 * time.Minute
 )
 
 func (s peerSignalingState) String() string {
@@ -185,8 +204,10 @@ type OverlayManager struct {
 	peers     []overlayPeer
 	knownPeerIDs map[string]bool
 
-	// Per-peer crypto: deviceID -> sharedKey
+	// Per-peer crypto: deviceID -> sharedKey (raw bytes kept for re-derivation check)
 	peerKeys map[string][]byte
+	// Per-peer cached AES-GCM cipher instances — avoids re-creating cipher on every packet.
+	peerCiphers map[string]cipher.AEAD
 
 	// Signaling state
 	peerStates     map[string]peerSignalingState
@@ -212,20 +233,26 @@ type OverlayManager struct {
 	wg       sync.WaitGroup
 	tunFd    int
 
-	// TUN diagnostic counter
-	tunPktLogged   int
-	tunPktLoggedMu sync.Mutex
+	// TUN diagnostic counter (capped at 30)
+	tunPktLogged atomic.Int32
 
 	// Computed public key
 	publicKeyBase64 string
 	privateKey      [32]byte
+
+	// Log level control — suppress per-packet logs after startup
+	debugPacketLog atomic.Bool
 }
+
+// maxSeenPerPeer caps the seenCandidates set per peer to prevent unbounded growth.
+const maxSeenPerPeer = 200
 
 // NewOverlayManager creates a new (stopped) OverlayManager.
 func NewOverlayManager() *OverlayManager {
 	return &OverlayManager{
 		knownPeerIDs:      make(map[string]bool),
 		peerKeys:          make(map[string][]byte),
+		peerCiphers:       make(map[string]cipher.AEAD),
 		peerStates:        make(map[string]peerSignalingState),
 		seenCandidates:    make(map[string]map[string]bool),
 		peerUfrags:        make(map[string]string),
@@ -344,11 +371,21 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 	m.running.Store(true)
 	m.cancelCh = make(chan struct{})
 
+	// Enable per-packet debug logging for the first 30 seconds after start.
+	m.debugPacketLog.Store(true)
+	go func() {
+		time.Sleep(30 * time.Second)
+		m.debugPacketLog.Store(false)
+		m.logf("[Overlay-Go] Per-packet debug logging disabled (30s elapsed)")
+	}()
+
 	// 13. Start signaling poll loop
+	m.wg.Add(1)
 	go m.signalingLoop()
 
 	// 14. Start TUN fd reader (overlay-only mode)
 	if cfg.Mode == "overlay" && cfg.TunnelFd > 0 {
+		m.wg.Add(1)
 		go m.tunReadLoop()
 	}
 
@@ -411,6 +448,13 @@ func (m *OverlayManager) Stop() error {
 	mgr.OnLocalCandidate = nil
 	mgr.OnConnectionStateChange = nil
 	mgr.Mu.Unlock()
+
+	// Clear crypto state
+	m.mu.Lock()
+	m.peerKeys = make(map[string][]byte)
+	m.peerCiphers = make(map[string]cipher.AEAD)
+	m.seenCandidates = make(map[string]map[string]bool)
+	m.mu.Unlock()
 
 	m.logf("[Overlay-Go] Stopped")
 	return nil
@@ -522,42 +566,59 @@ func (m *OverlayManager) deriveSharedKey(peerPublicKeyBase64 string) ([]byte, er
 }
 
 // deriveAllPeerKeys iterates over all known peers and derives a shared key
-// for each one that has a valid public key.
+// for each one that has a valid public key. Only re-derives if the peer's
+// public key has changed (avoids redundant X25519+HKDF every 20s refresh).
 func (m *OverlayManager) deriveAllPeerKeys() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	newKeys := make(map[string][]byte, len(m.peers))
+	newCiphers := make(map[string]cipher.AEAD, len(m.peers))
 	for _, peer := range m.peers {
 		if peer.PublicKey == "" {
-			m.logf("[Overlay-Go] No public key for peer %s, skipping key derivation", peer.ID)
 			continue
+		}
+		// Reuse existing key if peer's public key hasn't changed.
+		if existingKey, ok := m.peerKeys[peer.ID]; ok {
+			if existingCipher, cok := m.peerCiphers[peer.ID]; cok {
+				newKeys[peer.ID] = existingKey
+				newCiphers[peer.ID] = existingCipher
+				continue
+			}
 		}
 		key, err := m.deriveSharedKey(peer.PublicKey)
 		if err != nil {
 			m.logf("[Overlay-Go] ECDH failed for peer %s: %v", peer.ID, err)
 			continue
 		}
+		gcm, err := newAEAD(key)
+		if err != nil {
+			m.logf("[Overlay-Go] AES-GCM init failed for peer %s: %v", peer.ID, err)
+			continue
+		}
 		newKeys[peer.ID] = key
+		newCiphers[peer.ID] = gcm
 		m.logf("[Overlay-Go] Derived shared key for peer %s", peer.ID)
 	}
 	m.peerKeys = newKeys
+	m.peerCiphers = newCiphers
 }
 
-// encryptPacket encrypts plaintext using AES-256-GCM. The returned ciphertext
-// has a 12-byte nonce prepended (nonce || sealed), matching the Swift
-// CryptoKit AES.GCM.seal combined format.
-func (m *OverlayManager) encryptPacket(plaintext []byte, sharedKey []byte) ([]byte, error) {
+// newAEAD creates an AES-256-GCM cipher from a 32-byte key.
+func newAEAD(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+// encryptPacket encrypts plaintext using AES-256-GCM with a pre-cached cipher.
+// The returned ciphertext has a 12-byte nonce prepended (nonce || sealed),
+// matching the Swift CryptoKit AES.GCM.seal combined format.
+func (m *OverlayManager) encryptPacket(plaintext []byte, gcm cipher.AEAD) ([]byte, error) {
 	if len(plaintext) == 0 {
 		return nil, fmt.Errorf("refusing to encrypt empty packet")
-	}
-	block, err := aes.NewCipher(sharedKey)
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
 	}
 
 	nonce := make([]byte, gcm.NonceSize()) // 12 bytes
@@ -565,25 +626,13 @@ func (m *OverlayManager) encryptPacket(plaintext []byte, sharedKey []byte) ([]by
 		return nil, err
 	}
 
-	sealed := gcm.Seal(nil, nonce, plaintext, nil)
-	result := make([]byte, len(nonce)+len(sealed))
-	copy(result[:len(nonce)], nonce)
-	copy(result[len(nonce):], sealed)
-	return result, nil
+	// Seal appends to nonce slice — single allocation for nonce+ciphertext.
+	return gcm.Seal(nonce, nonce, plaintext, nil), nil
 }
 
-// decryptPacket decrypts a ciphertext produced by encryptPacket. It expects
-// the first 12 bytes to be the nonce.
-func (m *OverlayManager) decryptPacket(ciphertext []byte, sharedKey []byte) ([]byte, error) {
-	block, err := aes.NewCipher(sharedKey)
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-
+// decryptPacket decrypts a ciphertext produced by encryptPacket using a
+// pre-cached cipher. It expects the first 12 bytes to be the nonce.
+func (m *OverlayManager) decryptPacket(ciphertext []byte, gcm cipher.AEAD) ([]byte, error) {
 	nonceSize := gcm.NonceSize() // 12 bytes
 	if len(ciphertext) < nonceSize {
 		return nil, fmt.Errorf("ciphertext too short: %d bytes", len(ciphertext))
@@ -604,23 +653,24 @@ func (m *OverlayManager) decryptPacket(ciphertext []byte, sharedKey []byte) ([]b
 // This goroutine only runs in pure overlay mode; in hybrid mode mihomo owns
 // the TUN fd and routes overlay traffic through its p2p proxy outbounds.
 func (m *OverlayManager) tunReadLoop() {
-	m.wg.Add(1)
 	defer m.wg.Done()
 
-	// Log that the TUN read loop has started, so we can confirm it's alive.
 	m.logf("[Overlay-Go] TUN read loop started (fd=%d)", m.tunFd)
-
-	buf := make([]byte, 65535)
-	pktCount := 0
-	lastLogTime := time.Now()
 
 	// macOS/iOS utun prepends a 4-byte protocol family header to every
 	// packet.  We must skip it to reach the actual IP packet.
 	const utunHeaderLen = 4
 
+	pktCount := 0
+	lastLogTime := time.Now()
+
 	for m.running.Load() {
+		bufPtr := tunReadPool.Get().(*[]byte)
+		buf := *bufPtr
+
 		n, err := syscall.Read(m.tunFd, buf)
 		if err != nil {
+			tunReadPool.Put(bufPtr)
 			// EAGAIN on non-blocking fd is not fatal — just retry.
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 				time.Sleep(10 * time.Millisecond)
@@ -634,14 +684,14 @@ func (m *OverlayManager) tunReadLoop() {
 
 		// Skip utun protocol family header
 		if n <= utunHeaderLen {
+			tunReadPool.Put(bufPtr)
 			continue
 		}
-		packet := make([]byte, n-utunHeaderLen)
-		copy(packet, buf[utunHeaderLen:n])
-		pktLen := len(packet)
+		pktLen := n - utunHeaderLen
+		packet := buf[utunHeaderLen:n]
 
 		pktCount++
-		if time.Since(lastLogTime) >= 5*time.Second {
+		if time.Since(lastLogTime) >= 10*time.Second {
 			m.logf("[Overlay-Go] TUN read loop alive: %d packets in last interval", pktCount)
 			pktCount = 0
 			lastLogTime = time.Now()
@@ -649,76 +699,55 @@ func (m *OverlayManager) tunReadLoop() {
 
 		version := (packet[0] >> 4) & 0x0F
 		var dstIP string
-		var srcIP string
-		var proto string
 		switch version {
 		case 4:
 			if pktLen < 20 {
+				tunReadPool.Put(bufPtr)
 				continue
 			}
-			srcIP = fmt.Sprintf("%d.%d.%d.%d", packet[12], packet[13], packet[14], packet[15])
 			dstIP = fmt.Sprintf("%d.%d.%d.%d", packet[16], packet[17], packet[18], packet[19])
-			switch packet[9] {
-			case 1:
-				proto = "ICMP"
-			case 6:
-				proto = "TCP"
-			case 17:
-				proto = "UDP"
-			default:
-				proto = fmt.Sprintf("proto-%d", packet[9])
-			}
 		case 6:
 			if pktLen < 40 {
+				tunReadPool.Put(bufPtr)
 				continue
 			}
-			srcIP = net.IP(packet[8:24]).String()
 			dstIP = net.IP(packet[24:40]).String()
-			proto = "IPv6"
 		default:
+			tunReadPool.Put(bufPtr)
 			continue
 		}
 
-		// Log first 30 packets for debugging
+		// Skip loopback to self
 		m.mu.RLock()
 		localIP := m.overlayIP
 		m.mu.RUnlock()
-		m.tunPktLoggedMu.Lock()
-		if m.tunPktLogged < 30 {
-			m.tunPktLogged++
-			logged := m.tunPktLogged
-			m.tunPktLoggedMu.Unlock()
-			m.logf("[Overlay-Go] TUN pkt #%d: %d-byte %s %s -> %s (local=%s)", logged, pktLen, proto, srcIP, dstIP, localIP)
-		} else {
-			m.tunPktLoggedMu.Unlock()
-		}
-
-		// Skip loopback to self
 		if dstIP == localIP {
-			// Write back to TUN for local delivery
-			m.writeToTUN(packet)
+			// Copy packet before returning buffer to pool
+			pktCopy := make([]byte, pktLen)
+			copy(pktCopy, packet)
+			tunReadPool.Put(bufPtr)
+			m.writeToTUN(pktCopy)
 			continue
 		}
 
 		// Lookup peer by overlay IP
 		m.mu.RLock()
 		peerID, ok := m.routes[dstIP]
-		sharedKey, hasKey := m.peerKeys[peerID]
+		peerCipher, hasCipher := m.peerCiphers[peerID]
 		m.mu.RUnlock()
 
-		if !ok {
-			m.logf("[Overlay-Go] No route to %s (local: %s)", dstIP, localIP)
-			continue
-		}
-		if !hasKey {
-			m.logf("[Overlay-Go] No shared key for peer %s", peerID)
+		if !ok || !hasCipher {
+			tunReadPool.Put(bufPtr)
 			continue
 		}
 
-		m.logf("[Overlay-Go] routing %d-byte %s %s → to %s via %s", pktLen, proto, localIP, dstIP, truncateID(peerID))
+		// Copy packet data before returning buffer to pool
+		pktCopy := make([]byte, pktLen)
+		copy(pktCopy, packet)
+		tunReadPool.Put(bufPtr)
 
 		// Encrypt
-		encrypted, err := m.encryptPacket(packet, sharedKey)
+		encrypted, err := m.encryptPacket(pktCopy, peerCipher)
 		if err != nil {
 			m.logf("[Overlay-Go] Failed to encrypt packet for %s: %v", dstIP, err)
 			continue
@@ -726,7 +755,9 @@ func (m *OverlayManager) tunReadLoop() {
 
 		// Send via overlay transport
 		if err := globalOverlayTransport.Send(peerID, encrypted); err != nil {
-			m.logf("[Overlay-Go] Failed to send to %s: %v", dstIP, err)
+			if m.debugPacketLog.Load() {
+				m.logf("[Overlay-Go] Failed to send to %s: %v", dstIP, err)
+			}
 		}
 	}
 }
@@ -738,17 +769,18 @@ func (m *OverlayManager) writeToTUN(packet []byte) error {
 	if len(packet) < 1 {
 		return nil
 	}
-	var header [4]byte
+	bufPtr := tunWritePool.Get().(*[]byte)
+	buf := *bufPtr
+	defer tunWritePool.Put(bufPtr)
+
 	version := (packet[0] >> 4) & 0x0F
 	if version == 6 {
-		binary.LittleEndian.PutUint32(header[:], 30) // AF_INET6
+		binary.LittleEndian.PutUint32(buf[:4], 30) // AF_INET6
 	} else {
-		binary.LittleEndian.PutUint32(header[:], 2) // AF_INET
+		binary.LittleEndian.PutUint32(buf[:4], 2) // AF_INET
 	}
-	buf := make([]byte, 4+len(packet))
-	copy(buf[:4], header[:])
 	copy(buf[4:], packet)
-	_, err := syscall.Write(m.tunFd, buf)
+	_, err := syscall.Write(m.tunFd, buf[:4+len(packet)])
 	return err
 }
 
@@ -761,15 +793,15 @@ func (m *OverlayManager) handleInboundPacket(peerID string, payload []byte) {
 	}
 
 	m.mu.RLock()
-	sharedKey, ok := m.peerKeys[peerID]
+	peerCipher, ok := m.peerCiphers[peerID]
 	m.mu.RUnlock()
 
 	if !ok {
-		m.logf("[Overlay-Go] No shared key for inbound packet from %s", peerID)
+		m.logf("[Overlay-Go] No cipher for inbound packet from %s", peerID)
 		return
 	}
 
-	decrypted, err := m.decryptPacket(payload, sharedKey)
+	decrypted, err := m.decryptPacket(payload, peerCipher)
 	if err != nil {
 		m.logf("[Overlay-Go] Failed to decrypt packet from %s: %v", peerID, err)
 		return
@@ -777,11 +809,8 @@ func (m *OverlayManager) handleInboundPacket(peerID string, payload []byte) {
 
 	// Validate minimum IP packet size
 	if len(decrypted) < 20 {
-		m.logf("[Overlay-Go] Received packet too short from %s: %d bytes", peerID, len(decrypted))
 		return
 	}
-
-	m.logf("[Overlay-Go] Decrypted %d-byte packet from %s", len(decrypted), peerID)
 
 	// Write to TUN fd
 	if err := m.writeToTUN(decrypted); err != nil {
@@ -948,7 +977,6 @@ func (m *OverlayManager) buildRouteTable() {
 // for remote signaling every 5 seconds, with a full peer sync + route
 // refresh every 20 seconds (4th iteration).
 func (m *OverlayManager) signalingLoop() {
-	m.wg.Add(1)
 	defer m.wg.Done()
 	iteration := 0
 	ticker := time.NewTicker(5 * time.Second)
@@ -1273,8 +1301,9 @@ func (m *OverlayManager) initiateP2POffers() {
 
 // refreshOverlayRuntime performs a full peer sync: publishes empty
 // candidates as keep-alive, fetches the latest peer list, updates routes
-// and keys, prunes stale state for removed peers, and re-initiates P2P
-// offers. Called every 20 seconds from the signaling loop.
+// and keys (only if peer list changed), prunes stale state for removed
+// peers, and re-initiates P2P offers. Called every 20 seconds from the
+// signaling loop.
 func (m *OverlayManager) refreshOverlayRuntime() {
 	// Publish empty candidates (keep-alive)
 	if err := m.publishCandidates(nil, ""); err != nil {
@@ -1296,7 +1325,8 @@ func (m *OverlayManager) refreshOverlayRuntime() {
 	}
 
 	// Detect peer list changes
-	if !mapsEqual(m.knownPeerIDs, newPeerIDs) {
+	peersChanged := !mapsEqual(m.knownPeerIDs, newPeerIDs)
+	if peersChanged {
 		m.logf("[Overlay-Go] Peer list changed: %d -> %d peers",
 			len(m.knownPeerIDs), len(newPeerIDs))
 		m.pruneOverlayState(newPeerIDs)
@@ -1304,9 +1334,11 @@ func (m *OverlayManager) refreshOverlayRuntime() {
 	}
 	m.mu.Unlock()
 
-	// Update routes and keys
+	// Update routes always (cheap), keys only when peers changed
 	m.buildRouteTable()
-	m.deriveAllPeerKeys()
+	if peersChanged {
+		m.deriveAllPeerKeys()
+	}
 
 	// Re-initiate P2P offers
 	m.initiateP2POffers()
@@ -1353,6 +1385,16 @@ func (m *OverlayManager) pruneOverlayState(validPeerIDs map[string]bool) {
 	for id := range m.peerCooldownUntil {
 		if !validPeerIDs[id] {
 			delete(m.peerCooldownUntil, id)
+		}
+	}
+	for id := range m.peerCiphers {
+		if !validPeerIDs[id] {
+			delete(m.peerCiphers, id)
+		}
+	}
+	for id := range m.peerKeys {
+		if !validPeerIDs[id] {
+			delete(m.peerKeys, id)
 		}
 	}
 }
@@ -1477,13 +1519,14 @@ func (m *OverlayManager) configureICEServers() {
 		`{"urls":["stun:stun.qq.com:3478"]},` +
 		`{"urls":["stun:stun.aliyun.com:3478"]},` +
 		`{"urls":["stun:stun.miwifi.com:3478"]},` +
-		`{"urls":["stun:stun.syncthing.net:3478"]}` +
+		`{"urls":["stun:stun.syncthing.net:3478"]},` +
+		`{"urls":["turn:ctus.playstone.info:3478?transport=udp"],"username":"bigbig","credential":"123qwe"}` +
 		`]`
 
 	if err := SetICEServersJSON(iceConfig); err != nil {
 		m.logf("[Overlay-Go] Failed to configure ICE servers: %v", err)
 	} else {
-		m.logf("[Overlay-Go] ICE servers configured (7 STUN)")
+		m.logf("[Overlay-Go] ICE servers configured (7 STUN + 1 TURN)")
 	}
 }
 
@@ -1491,8 +1534,11 @@ func (m *OverlayManager) configureICEServers() {
 // Hybrid YAML injection
 // ---------------------------------------------------------------------------
 
-// injectHybridYAML reads the base proxy YAML and injects p2p outbound
-// entries and an overlay proxy-group, matching the Swift startHybrid logic.
+// injectHybridYAML reads the base proxy YAML and injects a complete Virtual LAN
+// overlay config block: p2p outbound entries, overlay proxy-group, and overlay
+// routing rules. The base YAML contains only proxy configuration — no overlay
+// placeholders. This function adds everything overlay-related as a self-contained
+// block that doesn't modify any existing proxy content.
 func (m *OverlayManager) injectHybridYAML() error {
 	m.mu.RLock()
 	hybridConfigPath := m.config.HybridConfigPath
@@ -1506,7 +1552,7 @@ func (m *OverlayManager) injectHybridYAML() error {
 		return fmt.Errorf("hybrid config path not set")
 	}
 
-	// Read existing YAML
+	// Read existing YAML (proxy-only config generated by Swift)
 	yamlBytes, err := os.ReadFile(hybridConfigPath)
 	if err != nil {
 		return fmt.Errorf("read hybrid config: %w", err)
@@ -1514,10 +1560,8 @@ func (m *OverlayManager) injectHybridYAML() error {
 	proxyYaml := string(yamlBytes)
 
 	// Resolve relay endpoint for YAML injection
-	// Fetch from registration result (use the relay endpoint from the transport)
 	relayEndpoint := ""
 	if m.httpClient != nil {
-		// Try to get it from a fresh registration
 		regResult, err := m.register()
 		if err == nil {
 			relayEndpoint = resolveRelayEndpoint(regResult.RelayEndpoint, serverURL)
@@ -1527,48 +1571,65 @@ func (m *OverlayManager) injectHybridYAML() error {
 		relayEndpoint = resolveRelayEndpoint("", serverURL)
 	}
 
-	// Build p2p outbound entries
-	var p2pBlock strings.Builder
+	// --- Build Virtual LAN overlay block ---
+
+	// 1. p2p outbound entries (go into proxies: section)
+	var p2pOutbounds strings.Builder
+	p2pOutbounds.WriteString("\n# --- Virtual LAN Outbounds ---")
 	for _, peer := range peers {
-		p2pBlock.WriteString("\n")
-		p2pBlock.WriteString(fmt.Sprintf("- name: \"p2p-%s\"\n", truncateID(peer.ID)))
-		p2pBlock.WriteString("  type: p2p\n")
-		p2pBlock.WriteString(fmt.Sprintf("  peer-id: \"%s\"\n", peer.ID))
-		p2pBlock.WriteString(fmt.Sprintf("  local-device-id: \"%s\"\n", deviceID))
-		p2pBlock.WriteString(fmt.Sprintf("  relay-endpoint: \"%s\"\n", relayEndpoint))
-		p2pBlock.WriteString(fmt.Sprintf("  access-token: \"%s\"\n", accessToken))
+		p2pOutbounds.WriteString(fmt.Sprintf("\n- name: \"p2p-%s\"", truncateID(peer.ID)))
+		p2pOutbounds.WriteString("\n  type: p2p")
+		p2pOutbounds.WriteString(fmt.Sprintf("\n  peer-id: \"%s\"", peer.ID))
+		p2pOutbounds.WriteString(fmt.Sprintf("\n  local-device-id: \"%s\"", deviceID))
+		p2pOutbounds.WriteString(fmt.Sprintf("\n  relay-endpoint: \"%s\"", relayEndpoint))
+		p2pOutbounds.WriteString(fmt.Sprintf("\n  access-token: \"%s\"", accessToken))
 	}
 
-	// Build overlay proxy-group
-	var overlayProxies strings.Builder
-	if len(peers) == 0 {
-		overlayProxies.WriteString("  - DIRECT")
-	} else {
-		for i, peer := range peers {
-			if i > 0 {
-				overlayProxies.WriteString("\n")
-			}
-			overlayProxies.WriteString(fmt.Sprintf("  - \"p2p-%s\"", truncateID(peer.ID)))
+	// 2. overlay proxy-group (goes into proxy-groups: section)
+	var overlayGroup strings.Builder
+	overlayGroup.WriteString("\n# --- Virtual LAN Group ---")
+	overlayGroup.WriteString("\n- name: overlay")
+	overlayGroup.WriteString("\n  type: select")
+	overlayGroup.WriteString("\n  proxies:")
+	for _, peer := range peers {
+		overlayGroup.WriteString(fmt.Sprintf("\n    - \"p2p-%s\"", truncateID(peer.ID)))
+	}
+	overlayGroup.WriteString("\n    - DIRECT")
+
+	// 3. overlay routing rules (goes into rules: section, must be first)
+	var overlayRules strings.Builder
+	overlayRules.WriteString("# --- Virtual LAN Rules ---")
+	overlayRules.WriteString("\n- IP-CIDR,100.96.0.0/12,overlay")
+
+	// --- Inject overlay block into YAML ---
+
+	// a) Insert p2p outbounds at end of proxies: section
+	if idx := strings.Index(proxyYaml, "\nproxy-groups:"); idx >= 0 {
+		proxyYaml = proxyYaml[:idx] + p2pOutbounds.String() + proxyYaml[idx:]
+	}
+
+	// b) Insert overlay group at end of proxy-groups: section.
+	// The YAML order is: proxy-groups → rule-providers → rules.
+	// We must insert before rule-providers (if present), otherwise before rules.
+	insertBeforeGroup := "\nrule-providers:"
+	if !strings.Contains(proxyYaml, insertBeforeGroup) {
+		insertBeforeGroup = "\nrules:"
+	}
+	if idx := strings.Index(proxyYaml, insertBeforeGroup); idx >= 0 {
+		proxyYaml = proxyYaml[:idx] + overlayGroup.String() + proxyYaml[idx:]
+	}
+
+	// c) Insert overlay rules at beginning of rules: section
+	if idx := strings.Index(proxyYaml, "\nrules:"); idx >= 0 {
+		// Find the end of the "rules:" line
+		lineEnd := strings.Index(proxyYaml[idx+1:], "\n")
+		if lineEnd >= 0 {
+			insertAt := idx + 1 + lineEnd
+			proxyYaml = proxyYaml[:insertAt] + "\n" + overlayRules.String() + proxyYaml[insertAt:]
 		}
 	}
 
-	overlayGroupBlock := "\n" +
-		"- name: overlay\n" +
-		"  type: fallback\n" +
-		"  proxies:\n" +
-		overlayProxies.String() + "\n\n"
-
-	// Insert p2p entries before proxy-groups:
-	if idx := strings.Index(proxyYaml, "\nproxy-groups:"); idx >= 0 {
-		proxyYaml = proxyYaml[:idx] + p2pBlock.String() + proxyYaml[idx:]
-	}
-
-	// Insert overlay group before rule-providers: (or rules: as fallback)
-	if idx := strings.Index(proxyYaml, "\nrule-providers:"); idx >= 0 {
-		proxyYaml = proxyYaml[:idx] + overlayGroupBlock + proxyYaml[idx:]
-	} else if idx := strings.Index(proxyYaml, "\nrules:"); idx >= 0 {
-		proxyYaml = proxyYaml[:idx] + overlayGroupBlock + proxyYaml[idx:]
-	}
+	m.logf("[Overlay-Go] Injected overlay config: %d p2p peers", len(peers))
 
 	// Write back
 	if err := os.WriteFile(hybridConfigPath, []byte(proxyYaml), 0644); err != nil {
@@ -1576,6 +1637,22 @@ func (m *OverlayManager) injectHybridYAML() error {
 	}
 
 	m.logf("[Overlay-Go] Hybrid config written with %d p2p peers", len(peers))
+	m.logf("[Overlay-Go] Final YAML (after overlay injection):\n%s", proxyYaml)
+
+	// Trigger mihomo config reload so it picks up the new p2p outbounds and
+	// overlay proxy group.  We call ReloadConfig directly (same Go process)
+	// instead of going through the REST API, because inside an iOS network
+	// extension the TUN captures all loopback traffic.
+	if globalService != nil {
+		if err := globalService.ReloadConfig(hybridConfigPath); err != nil {
+			m.logf("[Overlay-Go] mihomo config reload failed: %v (p2p outbounds not active)", err)
+		} else {
+			m.logf("[Overlay-Go] mihomo config reloaded successfully — p2p outbounds active")
+		}
+	} else {
+		m.logf("[Overlay-Go] Warning: globalService is nil, cannot reload mihomo config")
+	}
+
 	return nil
 }
 
@@ -1594,11 +1671,25 @@ func (m *OverlayManager) logf(format string, args ...any) {
 }
 
 // markSeen records a signaling key as seen for a peer. Caller must hold m.mu.
+// Enforces maxSeenPerPeer to prevent unbounded memory growth.
 func (m *OverlayManager) markSeen(peerID, sigKey string) {
 	if m.seenCandidates[peerID] == nil {
 		m.seenCandidates[peerID] = make(map[string]bool)
 	}
-	m.seenCandidates[peerID][sigKey] = true
+	seen := m.seenCandidates[peerID]
+	// If at capacity, clear the oldest half (simple eviction — no ordering needed
+	// since stale entries are harmless, they just cause a re-process).
+	if len(seen) >= maxSeenPerPeer {
+		count := 0
+		for k := range seen {
+			delete(seen, k)
+			count++
+			if count >= maxSeenPerPeer/2 {
+				break
+			}
+		}
+	}
+	seen[sigKey] = true
 }
 
 // hasSeen checks if a signaling key has been seen for a peer. Caller must hold m.mu.
