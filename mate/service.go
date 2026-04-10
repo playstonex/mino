@@ -18,15 +18,26 @@ import (
 )
 
 func init() {
-	// iOS Network Extension memory limit is ~50MB (iOS 17+), ~15MB (older).
-	// Cap Go heap to leave room for C/ObjC allocations and stack.
-	runtimeDebug.SetMemoryLimit(30 * 1024 * 1024) // 30 MB
+	switch runtime.GOOS {
+	case "ios":
+		// iOS Network Extension memory limit is ~50 MB (iOS 15+).
+		// Reserve headroom for C/ObjC/stack — cap Go heap at 40 MB.
+		runtimeDebug.SetMemoryLimit(40 * 1024 * 1024)
+		// Network Extension has limited CPU budget.
+		runtime.GOMAXPROCS(3)
+		// More aggressive GC to stay within memory budget.
+		runtimeDebug.SetGCPercent(50)
 
-	// Limit OS threads — Network Extension has limited CPU budget.
-	runtime.GOMAXPROCS(3)
+	case "darwin":
+		// macOS has no meaningful memory constraint for Network Extension.
+		// Leave defaults (no memory limit, GOMAXPROCS = NumCPU, GCPercent = 100).
 
-	// More aggressive GC to stay within memory budget.
-	runtimeDebug.SetGCPercent(50)
+	default:
+		// Conservative defaults for unknown platforms.
+		runtimeDebug.SetMemoryLimit(40 * 1024 * 1024)
+		runtime.GOMAXPROCS(3)
+		runtimeDebug.SetGCPercent(50)
+	}
 }
 
 type MihomoService struct {
