@@ -65,6 +65,7 @@ type OverlayConfig struct {
 	HybridConfigPath string `json:"hybridConfigPath"` // hybrid mode only
 	HomeDir          string `json:"homeDir"`
 	PublicKeyBase64  string `json:"publicKeyBase64"`   // optional, computed if empty
+	ICEServers       string `json:"iceServers,omitempty"` // JSON string, user-configured
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,11 +1508,21 @@ func (m *OverlayManager) wireP2PCallbacks() {
 // ICE server configuration
 // ---------------------------------------------------------------------------
 
-// configureICEServers sets up STUN servers for WebRTC NAT discovery.
-// Uses a mix of Chinese and international servers for global coverage.
-// TURN servers can be added to the JSON when deployed on the VPS:
-//   {"urls":["turn:VPS_IP:3478?transport=udp"], "username":"user", "credential":"pass"}
+// configureICEServers sets up STUN/TURN servers for WebRTC NAT discovery.
+// Uses user-configured servers from iceServers config field if present,
+// otherwise falls back to hardcoded defaults.
 func (m *OverlayManager) configureICEServers() {
+	// Use user-configured ICE servers if provided
+	if custom := m.config.ICEServers; custom != "" {
+		if err := SetICEServersJSON(custom); err != nil {
+			m.logf("[Overlay-Go] Failed to configure custom ICE servers: %v, falling back to defaults", err)
+		} else {
+			m.logf("[Overlay-Go] Custom ICE servers configured from user settings")
+			return
+		}
+	}
+
+	// Default fallback: hardcoded servers
 	iceConfig := `[` +
 		`{"urls":["stun:stun.l.google.com:19302"]},` +
 		`{"urls":["stun:stun1.l.google.com:19302"]},` +
