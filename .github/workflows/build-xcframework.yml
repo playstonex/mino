@@ -11,7 +11,7 @@ on:
       - "mate/**"
       - "build_xframework.sh"
     branches:
-      - Alpha
+      - develop
 
 jobs:
   build-xcframework:
