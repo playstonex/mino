@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/httputils"
+	N "github.com/metacubex/mihomo/common/net"
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/http/h2c"
@@ -18,13 +19,13 @@ import (
 	E "github.com/metacubex/sing/common/exceptions"
 	"github.com/metacubex/sing/common/logger"
 	M "github.com/metacubex/sing/common/metadata"
-	N "github.com/metacubex/sing/common/network"
+	"github.com/metacubex/sing/common/network"
 	"github.com/metacubex/tls"
 )
 
 type Handler interface {
-	N.TCPConnectionHandler
-	N.UDPConnectionHandler
+	network.TCPConnectionHandler
+	network.UDPConnectionHandler
 }
 
 type ICMPHandler interface {
@@ -227,7 +228,7 @@ func (s *Service) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		httputils.SetAddrFromRequest(&conn.NetAddr, request)
 		conn.setUp(request.Body, nil)
-		_ = s.handler.NewConnection(ctx, conn, M.Metadata{
+		_ = s.handler.NewConnection(ctx, N.NewDeadlineConn(conn), M.Metadata{
 			Protocol:    "trusttunnel",
 			Source:      M.ParseSocksaddr(request.RemoteAddr),
 			Destination: M.ParseSocksaddr(request.Host).Unwrap(),
