@@ -135,6 +135,7 @@ type overlaySnapshot struct {
 	PeerCount      int               `json:"peerCount"`
 	PeerIDs        []string          `json:"peerIds"`
 	ConnectionMode string            `json:"connectionMode"`
+	RelayEndpoint  string            `json:"relayEndpoint,omitempty"`
 	Peers          []overlayPeerInfo `json:"peers"`
 }
 
@@ -239,6 +240,9 @@ type OverlayManager struct {
 
 	// Route table: overlayIP -> peerID
 	routes map[string]string
+
+	// Relay info
+	relayEndpoint string
 
 	// Transport
 	platform PlatformInterface
@@ -377,6 +381,9 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 	if err := globalOverlayTransport.Configure(resolvedRelay, cfg.AccessToken, m.deviceID); err != nil {
 		m.logf("[Overlay-Go] Warning: overlay transport configure failed: %v", err)
 	}
+	m.mu.Lock()
+	m.relayEndpoint = resolvedRelay
+	m.mu.Unlock()
 	for _, p := range m.peers {
 		if err := globalOverlayTransport.RegisterPeer(p.ID); err != nil {
 			m.logf("[Overlay-Go] Warning: register relay peer %s: %v", p.ID, err)
@@ -565,6 +572,7 @@ func (m *OverlayManager) SnapshotJSON() string {
 		PeerCount:      len(m.peers),
 		PeerIDs:        peerIDs,
 		ConnectionMode: connectionMode,
+		RelayEndpoint:  m.relayEndpoint,
 		Peers:          peerInfos,
 	}
 
