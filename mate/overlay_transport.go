@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/metacubex/mihomo/transport/p2p"
 )
@@ -27,18 +28,32 @@ type overlayTransportManager struct {
 	// The overlay manager sets this to handle decrypt + TUN write internally,
 	// replacing the old Swift callback (OnOverlayPacket).
 	packetHandler func(peerID string, payload []byte)
+
+	// Relay backoff tracking (H2)
+	relayFailCount int
+	relayLastFail  time.Time
+
+	// readLoop cancellation (H3)
+	readLoopCancel map[string]chan struct{}
 }
 
 func newOverlayTransportManager() *overlayTransportManager {
 	return &overlayTransportManager{
-		peers:       make(map[string]struct{}),
-		packetConns: make(map[string]net.PacketConn),
+		peers:          make(map[string]struct{}),
+		packetConns:    make(map[string]net.PacketConn),
+		readLoopCancel: make(map[string]chan struct{}),
 	}
 }
 
 func (m *overlayTransportManager) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Cancel all readLoop goroutines before closing conns (H3)
+	for peerID, cancel := range m.readLoopCancel {
+		close(cancel)
+		delete(m.readLoopCancel, peerID)
+	}
 
 	for peerID, conn := range m.packetConns {
 		_ = conn.Close()
@@ -56,6 +71,9 @@ func (m *overlayTransportManager) Reset() {
 	m.localDeviceID = ""
 	m.peers = make(map[string]struct{})
 	m.packetHandler = nil
+	m.relayFailCount = 0
+	m.relayLastFail = time.Time{}
+	m.readLoopCancel = make(map[string]chan struct{})
 }
 
 func (m *overlayTransportManager) SetPlatform(platform PlatformInterface) {
@@ -135,14 +153,21 @@ func (m *overlayTransportManager) AttachPeerPacketConn(peerID string, conn net.P
 	_ = m.RegisterPeer(peerID)
 
 	m.mu.Lock()
+	// Cancel existing readLoop for this peer (H3)
+	if cancel, ok := m.readLoopCancel[peerID]; ok {
+		close(cancel)
+		delete(m.readLoopCancel, peerID)
+	}
 	if existing := m.packetConns[peerID]; existing != nil && existing != conn {
 		_ = existing.Close()
 	}
 	m.packetConns[peerID] = conn
+	cancel := make(chan struct{})
+	m.readLoopCancel[peerID] = cancel
 	m.mu.Unlock()
 
 	m.logf("[OverlayTransport] attached direct packet channel for peer %s", peerID)
-	go m.readLoop(peerID, conn)
+	go m.readLoop(peerID, conn, cancel)
 }
 
 // HasPacketConn returns true if a direct packet channel is registered for the peer.
@@ -158,11 +183,19 @@ func (m *overlayTransportManager) Send(peerID string, payload []byte) error {
 		return err
 	}
 
-	if conn := m.packetConn(peerID); conn != nil {
-		if _, err := conn.WriteTo(payload, &net.UDPAddr{}); err == nil {
+	// C1 fix: hold RLock during both packetConn lookup AND WriteTo to prevent
+	// readLoop from closing the conn between lookup and write.
+	m.mu.RLock()
+	conn := m.packetConns[peerID]
+	if conn != nil {
+		_, err := conn.WriteTo(payload, &net.UDPAddr{})
+		m.mu.RUnlock()
+		if err == nil {
 			return nil
 		}
 		// direct send failed, fall through to relay
+	} else {
+		m.mu.RUnlock()
 	}
 
 	relayClient, err := m.ensureRelay()
@@ -173,18 +206,35 @@ func (m *overlayTransportManager) Send(peerID string, payload []byte) error {
 	return relayClient.SendToPeer(peerID, payload)
 }
 
-func (m *overlayTransportManager) packetConn(peerID string) net.PacketConn {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.packetConns[peerID]
-}
+// packetConn is no longer used — Send() now holds RLock during lookup+write (C1).
+// Kept as unexported for potential future use.
 
 func (m *overlayTransportManager) ensureRelay() (*p2p.RelayClient, error) {
+	// Fast path: relay already exists
 	m.mu.RLock()
 	if m.relayClient != nil {
 		relayClient := m.relayClient
 		m.mu.RUnlock()
 		return relayClient, nil
+	}
+	m.mu.RUnlock()
+
+	// Slow path: need to create relay. Use write lock for the entire creation
+	// to prevent concurrent Send() calls from creating duplicate clients (C1).
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if m.relayClient != nil {
+		return m.relayClient, nil
+	}
+
+	// H2: Exponential backoff on relay creation failures
+	if m.relayFailCount > 0 && !m.relayLastFail.IsZero() {
+		backoff := time.Duration(1<<min(m.relayFailCount-1, 6)) * time.Second // 1s, 2s, 4s, ... 64s
+		if time.Since(m.relayLastFail) < backoff {
+			return nil, fmt.Errorf("relay creation in backoff (%v remaining)", backoff-time.Since(m.relayLastFail))
+		}
 	}
 
 	relayEndpoint := m.relayEndpoint
@@ -194,7 +244,6 @@ func (m *overlayTransportManager) ensureRelay() (*p2p.RelayClient, error) {
 	for peerID := range m.peers {
 		peerIDs = append(peerIDs, peerID)
 	}
-	m.mu.RUnlock()
 
 	if relayEndpoint == "" || accessToken == "" || localDeviceID == "" {
 		return nil, fmt.Errorf("overlay relay is not configured")
@@ -202,6 +251,8 @@ func (m *overlayTransportManager) ensureRelay() (*p2p.RelayClient, error) {
 
 	relayClient, err := p2p.NewRelayClient(relayEndpoint, accessToken, localDeviceID)
 	if err != nil {
+		m.relayFailCount++
+		m.relayLastFail = time.Now()
 		return nil, err
 	}
 
@@ -212,23 +263,26 @@ func (m *overlayTransportManager) ensureRelay() (*p2p.RelayClient, error) {
 	for _, peerID := range peerIDs {
 		if err := relayClient.AddPeer(peerID); err != nil {
 			_ = relayClient.Close()
+			m.relayFailCount++
+			m.relayLastFail = time.Now()
 			return nil, err
 		}
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.relayClient != nil {
-		_ = relayClient.Close()
-		return m.relayClient, nil
-	}
 	m.relayClient = relayClient
+	m.relayFailCount = 0
+	m.relayLastFail = time.Time{}
 	return relayClient, nil
 }
 
-func (m *overlayTransportManager) readLoop(peerID string, conn net.PacketConn) {
+func (m *overlayTransportManager) readLoop(peerID string, conn net.PacketConn, cancel <-chan struct{}) {
 	buf := make([]byte, 65535)
 	for {
+		select {
+		case <-cancel:
+			return
+		default:
+		}
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
 			break
@@ -241,6 +295,7 @@ func (m *overlayTransportManager) readLoop(peerID string, conn net.PacketConn) {
 	if current := m.packetConns[peerID]; current == conn {
 		delete(m.packetConns, peerID)
 	}
+	delete(m.readLoopCancel, peerID)
 }
 
 func (m *overlayTransportManager) dispatchPacket(peerID string, payload []byte) {

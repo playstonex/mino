@@ -43,7 +43,8 @@ jobs:
       - name: Zip XCFramework
         run: |
           cd build/xframework
-          zip -r Mate.xcframework.zip Mate.xcframework
+          # Use ditto to avoid __MACOSX metadata entries that confuse Xcode
+          ditto -c -k --sequesterRsrc --keepParent Mate.xcframework Mate.xcframework.zip
           echo "ZIP_SIZE=$(du -sh Mate.xcframework.zip | cut -f1)" >> $GITHUB_ENV
 
       - name: Compute checksum

@@ -1030,11 +1030,19 @@ func (m *OverlayManager) buildRouteTable() {
 // ---------------------------------------------------------------------------
 
 // signalingLoop runs in a background goroutine, polling the control plane
-// for remote signaling every 5 seconds, with a full peer sync + route
-// refresh every 20 seconds (4th iteration).
+// for remote signaling every 5 seconds (with jitter to prevent thundering
+// herd in multi-device deployments), with a full peer sync + route refresh
+// every 20 seconds (4th iteration).
 func (m *OverlayManager) signalingLoop() {
 	defer m.wg.Done()
 	iteration := 0
+
+	// M4: Add random jitter (0-2s) to prevent thundering herd
+	jitterBytes := make([]byte, 2)
+	_, _ = rand.Read(jitterBytes)
+	jitter := time.Duration(int(jitterBytes[0])*8+int(jitterBytes[1])) * time.Millisecond // 0-2s
+	time.Sleep(jitter)
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -1062,13 +1070,31 @@ func (m *OverlayManager) signalingLoop() {
 
 // pollRemoteSignaling fetches peers with their signaling candidates from
 // the control plane and injects SDPs and ICE candidates into the P2P
-// manager. This is a direct port of the Swift logic (~190 lines).
+// manager. Lock scope minimized: network I/O and P2P injection happen
+// outside the lock (H1).
 func (m *OverlayManager) pollRemoteSignaling() {
+	// Fetch peers outside the lock (network I/O)
 	peers, err := m.fetchPeers()
 	if err != nil {
 		m.logf("[Overlay-Go] Signaling poll failed: %v", err)
 		return
 	}
+
+	// Collect signaling work items under lock, execute outside
+	type sdpWork struct {
+		peerID  string
+		sigKey  string
+		sdpType string
+		payload string
+	}
+	type iceWork struct {
+		peerID  string
+		sigKey  string
+		payload string
+	}
+
+	var sdpItems []sdpWork
+	var iceItems []iceWork
 
 	m.mu.Lock()
 	myDeviceID := m.deviceID
@@ -1187,27 +1213,11 @@ func (m *OverlayManager) pollRemoteSignaling() {
 				currentState = peerStateIdle
 			}
 
+			shouldInject := false
 			if currentState == peerStateConnected {
 				m.logf("[Overlay-Go] Skipping new %s from %s, already connected", latestSDP.sdpType, truncateID(peer.ID))
 			} else if currentState == peerStateSDPReceived && isOfferer && latestSDP.sdpType == "answer" {
-				preview := truncateStr(latestSDP.candidate.Type, 120)
-				m.logf("[Overlay-Go] Injecting remote sdp (%s) from peer %s, len=%d, preview: %s",
-					latestSDP.sdpType, peer.ID, len(latestSDP.candidate.Type), preview)
-
-				msg := P2PSignalingMessage{Type: "sdp", Payload: latestSDP.candidate.Type, SDPType: latestSDP.sdpType}
-				if sigJSON, err := json.Marshal(msg); err == nil {
-					if injErr := AddP2PPeer(peer.ID, string(sigJSON)); injErr != nil {
-						m.logf("[Overlay-Go] Failed to inject SDP: %v", injErr)
-						m.peerStates[peer.ID] = peerStateFailed
-						m.failedPeers[peer.ID] = true
-					} else {
-						m.markSeen(peer.ID, latestSDP.sigKey)
-						m.peerUfrags[peer.ID] = extractUfrag(latestSDP.candidate.Type)
-						if sid := extractSessionID(latestSDP.candidate.Type); sid != "" {
-							m.peerSessionIDs[peer.ID] = sid
-						}
-					}
-				}
+				shouldInject = true
 			} else if currentState == peerStateSDPReceived {
 				m.logf("[Overlay-Go] Skipping new %s from %s, SDP already in progress (%s)",
 					latestSDP.sdpType, truncateID(peer.ID), currentState)
@@ -1218,29 +1228,20 @@ func (m *OverlayManager) pollRemoteSignaling() {
 				m.markSeen(peer.ID, latestSDP.sigKey)
 			} else {
 				// State is idle — safe to inject
-				preview := truncateStr(latestSDP.candidate.Type, 120)
-				m.logf("[Overlay-Go] Injecting remote sdp (%s) from peer %s, len=%d, preview: %s",
-					latestSDP.sdpType, peer.ID, len(latestSDP.candidate.Type), preview)
+				shouldInject = true
+			}
 
-				msg := P2PSignalingMessage{Type: "sdp", Payload: latestSDP.candidate.Type, SDPType: latestSDP.sdpType}
-				if sigJSON, err := json.Marshal(msg); err == nil {
-					if injErr := AddP2PPeer(peer.ID, string(sigJSON)); injErr != nil {
-						m.logf("[Overlay-Go] Failed to inject SDP: %v", injErr)
-						m.peerStates[peer.ID] = peerStateFailed
-						m.failedPeers[peer.ID] = true
-					} else {
-						m.markSeen(peer.ID, latestSDP.sigKey)
-						m.peerStates[peer.ID] = peerStateSDPReceived
-						m.peerUfrags[peer.ID] = extractUfrag(latestSDP.candidate.Type)
-						if sid := extractSessionID(latestSDP.candidate.Type); sid != "" {
-							m.peerSessionIDs[peer.ID] = sid
-						}
-					}
-				}
+			if shouldInject {
+				sdpItems = append(sdpItems, sdpWork{
+					peerID:  peer.ID,
+					sigKey:  latestSDP.sigKey,
+					sdpType: latestSDP.sdpType,
+					payload: latestSDP.candidate.Type,
+				})
 			}
 		}
 
-		// Only inject ICE candidates after SDP has been set
+		// Collect ICE candidates for injection
 		if m.peerStates[peer.ID] != peerStateSDPReceived && m.peerStates[peer.ID] != peerStateConnected {
 			continue
 		}
@@ -1271,20 +1272,64 @@ func (m *OverlayManager) pollRemoteSignaling() {
 				continue
 			}
 
-			preview := truncateStr(candidate.Type, 120)
-			m.logf("[Overlay-Go] Injecting remote candidate (ice) from peer %s, len=%d, preview: %s",
-				peer.ID, len(candidate.Type), preview)
-
-			msg := P2PSignalingMessage{Type: "candidate", Payload: candidate.Type}
-			if sigJSON, err := json.Marshal(msg); err == nil {
-				if injErr := AddP2PPeer(peer.ID, string(sigJSON)); injErr != nil {
-					m.logf("[Overlay-Go] Failed to inject ICE candidate: %v", injErr)
-				}
-				m.markSeen(peer.ID, sigKey)
-			}
+			iceItems = append(iceItems, iceWork{
+				peerID:  peer.ID,
+				sigKey:  sigKey,
+				payload: candidate.Type,
+			})
 		}
 	}
 	m.mu.Unlock()
+
+	// H1: Execute P2P injections outside the lock (AddP2PPeer, json.Marshal)
+	for _, item := range sdpItems {
+		preview := truncateStr(item.payload, 120)
+		m.logf("[Overlay-Go] Injecting remote sdp (%s) from peer %s, len=%d, preview: %s",
+			item.sdpType, item.peerID, len(item.payload), preview)
+
+		msg := P2PSignalingMessage{Type: "sdp", Payload: item.payload, SDPType: item.sdpType}
+		sigJSON, err := json.Marshal(msg)
+		if err != nil {
+			continue
+		}
+		injErr := AddP2PPeer(item.peerID, string(sigJSON))
+
+		m.mu.Lock()
+		if injErr != nil {
+			m.logf("[Overlay-Go] Failed to inject SDP: %v", injErr)
+			m.peerStates[item.peerID] = peerStateFailed
+			m.failedPeers[item.peerID] = true
+		} else {
+			m.markSeen(item.peerID, item.sigKey)
+			if m.peerStates[item.peerID] == peerStateIdle {
+				m.peerStates[item.peerID] = peerStateSDPReceived
+			}
+			m.peerUfrags[item.peerID] = extractUfrag(item.payload)
+			if sid := extractSessionID(item.payload); sid != "" {
+				m.peerSessionIDs[item.peerID] = sid
+			}
+		}
+		m.mu.Unlock()
+	}
+
+	for _, item := range iceItems {
+		preview := truncateStr(item.payload, 120)
+		m.logf("[Overlay-Go] Injecting remote candidate (ice) from peer %s, len=%d, preview: %s",
+			item.peerID, len(item.payload), preview)
+
+		msg := P2PSignalingMessage{Type: "candidate", Payload: item.payload}
+		sigJSON, err := json.Marshal(msg)
+		if err != nil {
+			continue
+		}
+		if injErr := AddP2PPeer(item.peerID, string(sigJSON)); injErr != nil {
+			m.logf("[Overlay-Go] Failed to inject ICE candidate: %v", injErr)
+		}
+
+		m.mu.Lock()
+		m.markSeen(item.peerID, item.sigKey)
+		m.mu.Unlock()
+	}
 }
 
 // ---------------------------------------------------------------------------
