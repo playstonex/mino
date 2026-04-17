@@ -192,6 +192,13 @@ func PingOverlayPeer(peerID string) string {
 	return globalOverlayManager.PingPeer(peerID)
 }
 
+// MatePingAllOverlayPeers pings all connected peers concurrently and returns
+// a JSON array of results. Blocks for up to 5 seconds.
+// Result: [{"peerID":"...","latencyMs":42,"error":""},...]
+func PingAllOverlayPeers() string {
+	return globalOverlayManager.PingAllPeers()
+}
+
 // func Version() string {
 // 	fmt.Printf("Mihomo Meta %s %s %s with %s %s\n",
 // 		C.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(), C.BuildTime)

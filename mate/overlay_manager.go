@@ -482,7 +482,13 @@ func (m *OverlayManager) Stop() error {
 	m.peerKeys = make(map[string][]byte)
 	m.peerCiphers = make(map[string]cipher.AEAD)
 	m.seenCandidates = make(map[string]map[string]bool)
+	m.peerLastPingMs = make(map[string]int64)
 	m.mu.Unlock()
+
+	// Clear pending pings
+	m.pingMu.Lock()
+	m.pendingPings = make(map[string]pingRecord)
+	m.pingMu.Unlock()
 
 	m.logf("[Overlay-Go] Stopped")
 	return nil
@@ -502,13 +508,6 @@ func (m *OverlayManager) SnapshotJSON() string {
 	peerInfos := make([]overlayPeerInfo, 0, len(m.peers))
 	for _, p := range m.peers {
 		state := m.peerStates[p.ID]
-		transportType := "relay"
-		switch state {
-		case peerStateConnected:
-			transportType = "p2p"
-		case peerStateSDPReceived:
-			transportType = "connecting"
-		}
 		dname := p.DeviceName
 		if dname == "" {
 			dname = "Unknown"
@@ -521,6 +520,16 @@ func (m *OverlayManager) SnapshotJSON() string {
 		if v, ok := m.peerLastPingMs[p.ID]; ok {
 			pingMs = v
 		}
+		// Determine actual transport path (direct P2P channel vs relay)
+		hasDirectConn := globalOverlayTransport.HasPacketConn(p.ID)
+		actualTransport := "relay"
+		if hasDirectConn && state == peerStateConnected {
+			actualTransport = "direct"
+		} else if state == peerStateConnected {
+			actualTransport = "p2p"
+		} else if state == peerStateSDPReceived {
+			actualTransport = "connecting"
+		}
 		peerInfos = append(peerInfos, overlayPeerInfo{
 			ID:             p.ID,
 			DeviceName:     dname,
@@ -528,7 +537,7 @@ func (m *OverlayManager) SnapshotJSON() string {
 			OverlayIP:      p.OverlayIP,
 			PublicKey:      p.PublicKey,
 			Status:         p.Status,
-			TransportType:  transportType,
+			TransportType:  actualTransport,
 			LastPingMs:     pingMs,
 		})
 	}
@@ -1034,6 +1043,10 @@ func (m *OverlayManager) signalingLoop() {
 			iteration++
 			if iteration%4 == 0 {
 				m.refreshOverlayRuntime()
+			}
+			// Auto-ping all peers every ~30 seconds (iteration 6 = 30s)
+			if iteration%6 == 0 {
+				m.autoPingAllPeers()
 			}
 		}
 	}
@@ -1709,9 +1722,6 @@ func (m *OverlayManager) injectHybridYAML() error {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-// logf logs a message via the platform interface if available, or to stderr.
-func (m *OverlayManager) logf(format string, args ...any) {
-
 // ---------------------------------------------------------------------------
 // Ping / Pong
 // ---------------------------------------------------------------------------
@@ -1769,6 +1779,65 @@ func (m *OverlayManager) sendControlPacket(peerID string, payload []byte) {
 		return
 	}
 	_ = globalOverlayTransport.Send(peerID, encrypted)
+}
+
+// autoPingAllPeers sends a non-blocking ping to every peer that has an
+// encryption key. Results are stored in peerLastPingMs for the snapshot.
+func (m *OverlayManager) autoPingAllPeers() {
+	m.mu.RLock()
+	peerIDs := make([]string, 0, len(m.peers))
+	for _, p := range m.peers {
+		if _, ok := m.peerCiphers[p.ID]; ok {
+			peerIDs = append(peerIDs, p.ID)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, pid := range peerIDs {
+		pid := pid
+		go func() {
+			// Build and send ping, wait up to 3s (shorter than manual ping)
+			ping := make([]byte, overlayPingSize)
+			ping[0] = overlayControlPrefix
+			ping[1] = overlayPingType
+			if _, err := rand.Read(ping[2:]); err != nil {
+				return
+			}
+			nonceHex := fmt.Sprintf("%x", ping[2:overlayPingSize])
+			now := time.Now()
+
+			m.pingMu.Lock()
+			m.pendingPings[nonceHex] = pingRecord{peerID: pid, sentAt: now}
+			m.pingMu.Unlock()
+
+			m.sendControlPacket(pid, ping)
+
+			// Wait up to 3s for pong
+			deadline := time.After(3 * time.Second)
+			tick := time.NewTicker(20 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-deadline:
+					m.pingMu.Lock()
+					delete(m.pendingPings, nonceHex)
+					m.pingMu.Unlock()
+					// Mark as timeout (-1)
+					m.mu.Lock()
+					m.peerLastPingMs[pid] = -1
+					m.mu.Unlock()
+					return
+				case <-tick.C:
+					m.pingMu.Lock()
+					_, pending := m.pendingPings[nonceHex]
+					m.pingMu.Unlock()
+					if !pending {
+						return // pong received
+					}
+				}
+			}
+		}()
+	}
 }
 
 // PingPeer sends a ping probe to the specified peer and returns the result
@@ -1840,6 +1909,50 @@ func (m *OverlayManager) PingPeer(peerID string) string {
 			}
 		}
 	}
+}
+
+// PingAllPeers pings all peers with encryption keys concurrently and returns
+// a JSON array of results. Blocks for up to 5 seconds.
+func (m *OverlayManager) PingAllPeers() string {
+	type pingResult struct {
+		PeerID    string `json:"peerID"`
+		LatencyMs int64  `json:"latencyMs"`
+		Error     string `json:"error,omitempty"`
+	}
+
+	m.mu.RLock()
+	peerIDs := make([]string, 0, len(m.peers))
+	for _, p := range m.peers {
+		if _, ok := m.peerCiphers[p.ID]; ok {
+			peerIDs = append(peerIDs, p.ID)
+		}
+	}
+	m.mu.RUnlock()
+
+	if len(peerIDs) == 0 {
+		return "[]"
+	}
+
+	results := make([]pingResult, len(peerIDs))
+	var wg sync.WaitGroup
+	for i, pid := range peerIDs {
+		i, pid := i, pid
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			raw := m.PingPeer(pid)
+			var r pingResult
+			if err := json.Unmarshal([]byte(raw), &r); err != nil {
+				results[i] = pingResult{PeerID: pid, LatencyMs: -1, Error: "parse error"}
+			} else {
+				results[i] = r
+			}
+		}()
+	}
+	wg.Wait()
+
+	data, _ := json.Marshal(results)
+	return string(data)
 }
 
 func (m *OverlayManager) logf(format string, args ...any) {
