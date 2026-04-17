@@ -185,6 +185,13 @@ func GetOverlaySnapshotJSON() string {
 	return globalOverlayManager.SnapshotJSON()
 }
 
+// MatePingOverlayPeer sends a ping to the specified peer and returns a JSON
+// result with the measured RTT. Blocks for up to 5 seconds.
+// Result: {"peerID":"...","latencyMs":42,"error":""}
+func PingOverlayPeer(peerID string) string {
+	return globalOverlayManager.PingPeer(peerID)
+}
+
 // func Version() string {
 // 	fmt.Printf("Mihomo Meta %s %s %s with %s %s\n",
 // 		C.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(), C.BuildTime)

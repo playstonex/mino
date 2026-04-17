@@ -146,7 +146,22 @@ type overlayPeerInfo struct {
 	PublicKey      string `json:"publicKey"`
 	Status         string `json:"status"`
 	TransportType  string `json:"transportType"`
+	LastPingMs     int64  `json:"lastPingMs"` // -1 = not measured, 0+ = RTT in ms
 }
+
+// ---------------------------------------------------------------------------
+// Overlay control packet markers
+// ---------------------------------------------------------------------------
+// Decrypted overlay payloads that start with byte 0x00 are control messages
+// (ping/pong). Real IP packets start with 0x45 (IPv4) or 0x60 (IPv6), so
+// there is no ambiguity.
+const (
+	overlayControlPrefix byte = 0x00
+	overlayPingType      byte = 0x01
+	overlayPongType      byte = 0x02
+	// Ping/pong payload: [0x00, type, 8-byte nonce]
+	overlayPingSize = 10
+)
 
 // ---------------------------------------------------------------------------
 // Peer signaling state machine
@@ -243,6 +258,16 @@ type OverlayManager struct {
 
 	// Log level control — suppress per-packet logs after startup
 	debugPacketLog atomic.Bool
+
+	// Ping tracking
+	peerLastPingMs map[string]int64      // peerID -> last measured RTT in ms (-1 = not measured)
+	pendingPings   map[string]pingRecord // nonce-hex -> pending ping
+	pingMu         sync.Mutex
+}
+
+type pingRecord struct {
+	peerID string
+	sentAt time.Time
 }
 
 // maxSeenPerPeer caps the seenCandidates set per peer to prevent unbounded growth.
@@ -258,6 +283,8 @@ func NewOverlayManager() *OverlayManager {
 		seenCandidates:    make(map[string]map[string]bool),
 		peerUfrags:        make(map[string]string),
 		peerSessionIDs:    make(map[string]string),
+		peerLastPingMs:    make(map[string]int64),
+		pendingPings:      make(map[string]pingRecord),
 		offeredPeers:      make(map[string]bool),
 		failedPeers:       make(map[string]bool),
 		peerFailCount:     make(map[string]int),
@@ -490,6 +517,10 @@ func (m *OverlayManager) SnapshotJSON() string {
 		if plat == "" {
 			plat = "unknown"
 		}
+		pingMs := int64(-1)
+		if v, ok := m.peerLastPingMs[p.ID]; ok {
+			pingMs = v
+		}
 		peerInfos = append(peerInfos, overlayPeerInfo{
 			ID:             p.ID,
 			DeviceName:     dname,
@@ -498,6 +529,7 @@ func (m *OverlayManager) SnapshotJSON() string {
 			PublicKey:      p.PublicKey,
 			Status:         p.Status,
 			TransportType:  transportType,
+			LastPingMs:     pingMs,
 		})
 	}
 
@@ -805,6 +837,12 @@ func (m *OverlayManager) handleInboundPacket(peerID string, payload []byte) {
 	decrypted, err := m.decryptPacket(payload, peerCipher)
 	if err != nil {
 		m.logf("[Overlay-Go] Failed to decrypt packet from %s: %v", peerID, err)
+		return
+	}
+
+	// Check for overlay control packets (ping/pong)
+	if len(decrypted) >= 2 && decrypted[0] == overlayControlPrefix {
+		m.handleControlPacket(peerID, decrypted)
 		return
 	}
 
@@ -1672,6 +1710,138 @@ func (m *OverlayManager) injectHybridYAML() error {
 // ---------------------------------------------------------------------------
 
 // logf logs a message via the platform interface if available, or to stderr.
+func (m *OverlayManager) logf(format string, args ...any) {
+
+// ---------------------------------------------------------------------------
+// Ping / Pong
+// ---------------------------------------------------------------------------
+
+// handleControlPacket processes overlay control messages (ping/pong).
+func (m *OverlayManager) handleControlPacket(peerID string, data []byte) {
+	if len(data) < 2 {
+		return
+	}
+	switch data[1] {
+	case overlayPingType:
+		// Received a ping — reply with pong using the same nonce
+		if len(data) < overlayPingSize {
+			return
+		}
+		pong := make([]byte, overlayPingSize)
+		copy(pong, data)
+		pong[1] = overlayPongType
+		m.sendControlPacket(peerID, pong)
+
+	case overlayPongType:
+		// Received a pong — match to pending ping and record RTT
+		if len(data) < overlayPingSize {
+			return
+		}
+		nonceHex := fmt.Sprintf("%x", data[2:overlayPingSize])
+		m.pingMu.Lock()
+		rec, ok := m.pendingPings[nonceHex]
+		if ok {
+			delete(m.pendingPings, nonceHex)
+		}
+		m.pingMu.Unlock()
+
+		if ok && rec.peerID == peerID {
+			rtt := time.Since(rec.sentAt).Milliseconds()
+			m.mu.Lock()
+			m.peerLastPingMs[peerID] = rtt
+			m.mu.Unlock()
+			m.logf("[Overlay-Ping] Pong from %s: %dms", truncateID(peerID), rtt)
+		}
+	}
+}
+
+// sendControlPacket encrypts and sends a control packet to a peer.
+func (m *OverlayManager) sendControlPacket(peerID string, payload []byte) {
+	m.mu.RLock()
+	peerCipher, ok := m.peerCiphers[peerID]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+
+	encrypted, err := m.encryptPacket(payload, peerCipher)
+	if err != nil {
+		return
+	}
+	_ = globalOverlayTransport.Send(peerID, encrypted)
+}
+
+// PingPeer sends a ping probe to the specified peer and returns the result
+// as a JSON string. It blocks for up to 5 seconds waiting for the pong.
+// Result: {"peerID":"...","latencyMs":42,"error":""} or {"error":"..."}
+func (m *OverlayManager) PingPeer(peerID string) string {
+	type pingResult struct {
+		PeerID    string `json:"peerID"`
+		LatencyMs int64  `json:"latencyMs"`
+		Error     string `json:"error,omitempty"`
+	}
+
+	marshal := func(r pingResult) string {
+		data, _ := json.Marshal(r)
+		return string(data)
+	}
+
+	if !m.running.Load() {
+		return marshal(pingResult{PeerID: peerID, LatencyMs: -1, Error: "overlay not running"})
+	}
+
+	m.mu.RLock()
+	_, hasCipher := m.peerCiphers[peerID]
+	m.mu.RUnlock()
+	if !hasCipher {
+		return marshal(pingResult{PeerID: peerID, LatencyMs: -1, Error: "no encryption key for peer"})
+	}
+
+	// Build ping packet: [0x00, 0x01, 8-byte random nonce]
+	ping := make([]byte, overlayPingSize)
+	ping[0] = overlayControlPrefix
+	ping[1] = overlayPingType
+	if _, err := rand.Read(ping[2:]); err != nil {
+		return marshal(pingResult{PeerID: peerID, LatencyMs: -1, Error: "failed to generate nonce"})
+	}
+
+	nonceHex := fmt.Sprintf("%x", ping[2:overlayPingSize])
+	now := time.Now()
+
+	m.pingMu.Lock()
+	m.pendingPings[nonceHex] = pingRecord{peerID: peerID, sentAt: now}
+	m.pingMu.Unlock()
+
+	// Send the encrypted ping
+	m.sendControlPacket(peerID, ping)
+
+	// Wait for pong (poll peerLastPingMs)
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			m.pingMu.Lock()
+			delete(m.pendingPings, nonceHex)
+			m.pingMu.Unlock()
+			return marshal(pingResult{PeerID: peerID, LatencyMs: -1, Error: "timeout"})
+		case <-ticker.C:
+			m.pingMu.Lock()
+			_, stillPending := m.pendingPings[nonceHex]
+			m.pingMu.Unlock()
+			if !stillPending {
+				// Pong was received and processed by handleControlPacket
+				m.mu.RLock()
+				rtt := m.peerLastPingMs[peerID]
+				m.mu.RUnlock()
+				return marshal(pingResult{PeerID: peerID, LatencyMs: rtt})
+			}
+		}
+	}
+}
+
 func (m *OverlayManager) logf(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	if m.platform != nil {
