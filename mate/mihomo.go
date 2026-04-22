@@ -175,13 +175,21 @@ func StartHybrid(configJSON string, platformInterface PlatformInterface) error {
 }
 
 // MateStopOverlay stops the overlay manager gracefully.
+// Safe to call even when overlay was never started.
 func StopOverlay() error {
+	if globalOverlayManager == nil {
+		return nil
+	}
 	return globalOverlayManager.Stop()
 }
 
 // MateGetOverlaySnapshotJSON returns the current overlay state for UI display.
 // The returned JSON matches Swift's OverlaySnapshot schema exactly.
+// Returns "{}" when overlay is not running (proxy-only mode).
 func GetOverlaySnapshotJSON() string {
+	if globalOverlayManager == nil || !globalOverlayManager.running.Load() {
+		return "{}"
+	}
 	return globalOverlayManager.SnapshotJSON()
 }
 
@@ -189,6 +197,9 @@ func GetOverlaySnapshotJSON() string {
 // result with the measured RTT. Blocks for up to 5 seconds.
 // Result: {"peerID":"...","latencyMs":42,"error":""}
 func PingOverlayPeer(peerID string) string {
+	if globalOverlayManager == nil || !globalOverlayManager.running.Load() {
+		return fmt.Sprintf(`{"peerID":"%s","latencyMs":-1,"error":"overlay not running"}`, peerID)
+	}
 	return globalOverlayManager.PingPeer(peerID)
 }
 
@@ -196,6 +207,9 @@ func PingOverlayPeer(peerID string) string {
 // a JSON array of results. Blocks for up to 5 seconds.
 // Result: [{"peerID":"...","latencyMs":42,"error":""},...]
 func PingAllOverlayPeers() string {
+	if globalOverlayManager == nil || !globalOverlayManager.running.Load() {
+		return "[]"
+	}
 	return globalOverlayManager.PingAllPeers()
 }
 
