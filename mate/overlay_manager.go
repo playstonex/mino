@@ -272,6 +272,9 @@ type OverlayManager struct {
 type pingRecord struct {
 	peerID string
 	sentAt time.Time
+	// result, when non-nil, receives the RTT in ms on pong. Buffered
+	// capacity 1 so handleControlPacket never blocks.
+	result chan int64
 }
 
 // maxSeenPerPeer caps the seenCandidates set per peer to prevent unbounded growth.
@@ -1095,6 +1098,11 @@ func (m *OverlayManager) pollRemoteSignaling() {
 
 	var sdpItems []sdpWork
 	var iceItems []iceWork
+	// Provisional ufrags from SDPs queued in this poll, keyed by peer ID.
+	// Lets ICE candidates that arrive in the same /overlay/peers response
+	// be injected immediately after the SDP, instead of waiting ~5s for the
+	// next poll.
+	pendingUfrags := make(map[string]string)
 
 	m.mu.Lock()
 	myDeviceID := m.deviceID
@@ -1238,16 +1246,35 @@ func (m *OverlayManager) pollRemoteSignaling() {
 					sdpType: latestSDP.sdpType,
 					payload: latestSDP.candidate.Type,
 				})
+				// Record the incoming SDP's ufrag so ICE candidates arriving
+				// in the same poll can be injected without waiting for the
+				// next cycle. Actual m.peerUfrags is updated after successful
+				// injection in the post-unlock loop.
+				if u := extractUfrag(latestSDP.candidate.Type); u != "" {
+					pendingUfrags[peer.ID] = u
+				}
 			}
 		}
 
 		// Collect ICE candidates for injection
-		if m.peerStates[peer.ID] != peerStateSDPReceived && m.peerStates[peer.ID] != peerStateConnected {
+		currentState := m.peerStates[peer.ID]
+		pendingUfrag, hasPending := pendingUfrags[peer.ID]
+		if currentState != peerStateSDPReceived && currentState != peerStateConnected && !hasPending {
 			continue
 		}
-		currentUfrag, hasUfrag := m.peerUfrags[peer.ID]
-		if !hasUfrag {
-			continue
+		// Prefer the ufrag from the SDP queued this poll so ICE from a
+		// retry/restart is matched against the fresh session instead of
+		// the stale cached ufrag.
+		var currentUfrag string
+		switch {
+		case hasPending:
+			currentUfrag = pendingUfrag
+		default:
+			var hasUfrag bool
+			currentUfrag, hasUfrag = m.peerUfrags[peer.ID]
+			if !hasUfrag {
+				continue
+			}
 		}
 
 		for _, candidate := range iceCandidates {
@@ -1322,8 +1349,12 @@ func (m *OverlayManager) pollRemoteSignaling() {
 		if err != nil {
 			continue
 		}
+		// Only mark as seen on successful injection so the candidate can
+		// be retried on the next poll if injection failed (e.g. SDP not
+		// yet applied or peer still warming up).
 		if injErr := AddP2PPeer(item.peerID, string(sigJSON)); injErr != nil {
 			m.logf("[Overlay-Go] Failed to inject ICE candidate: %v", injErr)
+			continue
 		}
 
 		m.mu.Lock()
@@ -1813,6 +1844,12 @@ func (m *OverlayManager) handleControlPacket(peerID string, data []byte) {
 			m.mu.Lock()
 			m.peerLastPingMs[peerID] = rtt
 			m.mu.Unlock()
+			if rec.result != nil {
+				select {
+				case rec.result <- rtt:
+				default:
+				}
+			}
 			m.logf("[Overlay-Ping] Pong from %s: %dms", truncateID(peerID), rtt)
 		}
 	}
@@ -1929,38 +1966,25 @@ func (m *OverlayManager) PingPeer(peerID string) string {
 
 	nonceHex := fmt.Sprintf("%x", ping[2:overlayPingSize])
 	now := time.Now()
+	// Buffered so handleControlPacket delivers the RTT without blocking,
+	// even if we hit the timeout branch below first.
+	resultCh := make(chan int64, 1)
 
 	m.pingMu.Lock()
-	m.pendingPings[nonceHex] = pingRecord{peerID: peerID, sentAt: now}
+	m.pendingPings[nonceHex] = pingRecord{peerID: peerID, sentAt: now, result: resultCh}
 	m.pingMu.Unlock()
 
 	// Send the encrypted ping
 	m.sendControlPacket(peerID, ping)
 
-	// Wait for pong (poll peerLastPingMs)
-	deadline := time.After(5 * time.Second)
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-deadline:
-			m.pingMu.Lock()
-			delete(m.pendingPings, nonceHex)
-			m.pingMu.Unlock()
-			return marshal(pingResult{PeerID: peerID, LatencyMs: -1, Error: "timeout"})
-		case <-ticker.C:
-			m.pingMu.Lock()
-			_, stillPending := m.pendingPings[nonceHex]
-			m.pingMu.Unlock()
-			if !stillPending {
-				// Pong was received and processed by handleControlPacket
-				m.mu.RLock()
-				rtt := m.peerLastPingMs[peerID]
-				m.mu.RUnlock()
-				return marshal(pingResult{PeerID: peerID, LatencyMs: rtt})
-			}
-		}
+	select {
+	case rtt := <-resultCh:
+		return marshal(pingResult{PeerID: peerID, LatencyMs: rtt})
+	case <-time.After(5 * time.Second):
+		m.pingMu.Lock()
+		delete(m.pendingPings, nonceHex)
+		m.pingMu.Unlock()
+		return marshal(pingResult{PeerID: peerID, LatencyMs: -1, Error: "timeout"})
 	}
 }
 
