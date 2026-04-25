@@ -1,32 +1,5 @@
-# Binaries for programs and plugins
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-bin/*
-mihomo/*
-mate.xcframework/*
-# Test binary, build with `go test -c`
-*.test
-/build/*
-
-# Output of the go coverage tool, specifically when used with LiteIDE
-*.out
-
-# go mod vendor
-vendor
-
-# GoLand
-.idea/*
-
-# macOS file
-.DS_Store
-
-# test suite
-test/config/cache*
-/output
-.vscode/
-.fleet/build/
-.claude/
-
+__pycache__
+venv
+build
+mihomo.egg-info
+*.ipynb
