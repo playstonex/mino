@@ -852,9 +852,13 @@ func parseTLS(cfg *RawConfig) (*TLS, error) {
 	}, nil
 }
 
+// builtinProxyCount counts the fixed proxies added by parseProxies
+// (DIRECT, REJECT, REJECT-DROP, COMPATIBLE, PASS, GLOBAL).
+const builtinProxyCount = 6
+
 func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[string]P.ProxyProvider, err error) {
-	proxies = make(map[string]C.Proxy)
-	providersMap = make(map[string]P.ProxyProvider)
+	proxies = make(map[string]C.Proxy, len(cfg.Proxy)+len(cfg.ProxyGroup)+builtinProxyCount)
+	providersMap = make(map[string]P.ProxyProvider, len(cfg.ProxyProvider)+1) // +1 for provider.ReservedName
 	proxiesConfig := cfg.Proxy
 	groupsConfig := cfg.ProxyGroup
 	providersConfig := cfg.ProxyProvider
@@ -968,7 +972,7 @@ func parseProxies(cfg *RawConfig) (proxies map[string]C.Proxy, providersMap map[
 }
 
 func parseListeners(cfg *RawConfig) (listeners map[string]C.InboundListener, err error) {
-	listeners = make(map[string]C.InboundListener)
+	listeners = make(map[string]C.InboundListener, len(cfg.Listeners))
 	for index, mapping := range cfg.Listeners {
 		inboundListener, err := listener.ParseListener(mapping)
 		if err != nil {
