@@ -3,3 +3,7 @@ venv
 build
 mihomo.egg-info
 *.ipynb
+
+# go.work is generated dynamically by build_xframework.sh
+go.work
+go.work.sum
