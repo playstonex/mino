@@ -381,8 +381,11 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 
 	// 7. Configure overlay transport (relay)
 	resolvedRelay := resolveRelayEndpoint(regResult.RelayEndpoint, cfg.ServerURL)
+	m.logf("[Overlay-Go] Relay endpoint: raw=%q resolved=%q", regResult.RelayEndpoint, resolvedRelay)
 	if err := globalOverlayTransport.Configure(resolvedRelay, cfg.AccessToken, m.deviceID); err != nil {
 		m.logf("[Overlay-Go] Warning: overlay transport configure failed: %v", err)
+	} else {
+		m.logf("[Overlay-Go] Overlay transport configured OK (relay=%q)", resolvedRelay)
 	}
 	m.mu.Lock()
 	m.relayEndpoint = resolvedRelay
@@ -1605,7 +1608,9 @@ func (m *OverlayManager) wireP2PCallbacks() {
 		case "connecting":
 			// Don't change state if already tracking as sdpReceived
 		case "disconnected":
-			m.logf("[Overlay-Go] P2P disconnected for %s, waiting for recovery...", truncateID(peerID))
+			m.logf("[Overlay-Go] P2P disconnected for %s, resetting state to allow re-negotiation", truncateID(peerID))
+			m.peerStates[peerID] = peerStateFailed
+			m.failedPeers[peerID] = true
 		case "failed":
 			m.peerStates[peerID] = peerStateFailed
 			m.failedPeers[peerID] = true
