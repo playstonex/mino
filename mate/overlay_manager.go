@@ -65,7 +65,7 @@ type OverlayConfig struct {
 	Mode             string `json:"mode"`             // "overlay" | "hybrid"
 	HybridConfigPath string `json:"hybridConfigPath"` // hybrid mode only
 	HomeDir          string `json:"homeDir"`
-	PublicKeyBase64  string `json:"publicKeyBase64"`   // optional, computed if empty
+	PublicKeyBase64  string `json:"publicKeyBase64"`      // optional, computed if empty
 	ICEServers       string `json:"iceServers,omitempty"` // JSON string, user-configured
 }
 
@@ -157,14 +157,14 @@ type overlaySnapshot struct {
 }
 
 type overlayPeerInfo struct {
-	ID             string `json:"id"`
-	DeviceName     string `json:"deviceName"`
-	Platform       string `json:"platform"`
-	OverlayIP      string `json:"overlayIp"`
-	PublicKey      string `json:"publicKey"`
-	Status         string `json:"status"`
-	TransportType  string `json:"transportType"`
-	LastPingMs     int64  `json:"lastPingMs"` // -1 = not measured, 0+ = RTT in ms
+	ID            string `json:"id"`
+	DeviceName    string `json:"deviceName"`
+	Platform      string `json:"platform"`
+	OverlayIP     string `json:"overlayIp"`
+	PublicKey     string `json:"publicKey"`
+	Status        string `json:"status"`
+	TransportType string `json:"transportType"`
+	LastPingMs    int64  `json:"lastPingMs"` // -1 = not measured, 0+ = RTT in ms
 }
 
 // ---------------------------------------------------------------------------
@@ -233,9 +233,9 @@ type OverlayManager struct {
 	httpClient *http.Client
 
 	// Registration state
-	deviceID  string
-	overlayIP string
-	peers     []overlayPeer
+	deviceID     string
+	overlayIP    string
+	peers        []overlayPeer
 	knownPeerIDs map[string]bool
 
 	// Per-peer crypto: deviceID -> sharedKey (raw bytes kept for re-derivation check)
@@ -561,25 +561,24 @@ func (m *OverlayManager) SnapshotJSON() string {
 		if v, ok := m.peerLastPingMs[p.ID]; ok {
 			pingMs = v
 		}
-		// Determine actual transport path (direct P2P channel vs relay)
+		// Determine actual transport path. Relay is the default; a peer only
+		// becomes direct after the P2P packet DataChannel is actually usable.
 		hasDirectConn := globalOverlayTransport.HasPacketConn(p.ID)
 		actualTransport := "relay"
 		if hasDirectConn && state == peerStateConnected {
 			actualTransport = "direct"
-		} else if state == peerStateConnected {
-			actualTransport = "p2p"
 		} else if state == peerStateSDPReceived {
 			actualTransport = "connecting"
 		}
 		peerInfos = append(peerInfos, overlayPeerInfo{
-			ID:             p.ID,
-			DeviceName:     dname,
-			Platform:       plat,
-			OverlayIP:      p.OverlayIP,
-			PublicKey:      p.PublicKey,
-			Status:         p.Status,
-			TransportType:  actualTransport,
-			LastPingMs:     pingMs,
+			ID:            p.ID,
+			DeviceName:    dname,
+			Platform:      plat,
+			OverlayIP:     p.OverlayIP,
+			PublicKey:     p.PublicKey,
+			Status:        p.Status,
+			TransportType: actualTransport,
+			LastPingMs:    pingMs,
 		})
 	}
 
@@ -589,12 +588,22 @@ func (m *OverlayManager) SnapshotJSON() string {
 	}
 
 	modeStr := m.config.Mode
-	connectionMode := "raw-packet" // overlay-only: direct TUN read/write
+	connectionMode := "relay"
 	if modeStr == "hybrid" {
-		connectionMode = "hybrid" // proxy + overlay via mihomo
+		connectionMode = "hybrid"
 	}
 	if !m.running.Load() {
 		connectionMode = "disconnected"
+	} else if modeStr != "hybrid" {
+		for _, peer := range peerInfos {
+			if peer.TransportType == "direct" {
+				connectionMode = "p2p-direct"
+				break
+			}
+			if peer.TransportType == "connecting" {
+				connectionMode = "connecting"
+			}
+		}
 	}
 
 	snap := overlaySnapshot{
@@ -727,7 +736,6 @@ func (m *OverlayManager) decryptPacket(ciphertext []byte, gcm cipher.AEAD) ([]by
 	sealed := ciphertext[nonceSize:]
 	return gcm.Open(nil, nonce, sealed, nil)
 }
-
 
 // ---------------------------------------------------------------------------
 // TUN fd operations (overlay-only mode)
@@ -1537,68 +1545,10 @@ func (m *OverlayManager) pollRemoteSignaling() {
 // P2P offer initiation
 // ---------------------------------------------------------------------------
 
-// initiateP2POffers iterates over all known peers where we are the offerer
-// (myDeviceID < peerID) and initiates WebRTC offers for peers that haven't
-// been offered yet or have failed and need a retry.
+// initiateP2POffers intentionally does not start WebRTC. Relay is the
+// default transport; direct P2P is opt-in via ForceP2POffer.
 func (m *OverlayManager) initiateP2POffers() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	myDeviceID := m.deviceID
-
-	for _, peer := range m.peers {
-		state := m.peerStates[peer.ID]
-
-		// Skip connected or in-progress peers
-		if state == peerStateConnected || state == peerStateSDPReceived {
-			continue
-		}
-
-		// Skip peers in P2P cooldown (relay-only)
-		if cooldownUntil, ok := m.peerCooldownUntil[peer.ID]; ok && time.Now().Before(cooldownUntil) {
-			continue
-		}
-		// Cooldown expired — allow retry
-		if _, hadCooldown := m.peerCooldownUntil[peer.ID]; hadCooldown {
-			delete(m.peerCooldownUntil, peer.ID)
-			delete(m.peerFailCount, peer.ID)
-		}
-
-		// Skip if already offered (unless failed, which allows retry)
-		if m.offeredPeers[peer.ID] && state != peerStateFailed {
-			continue
-		}
-
-		if myDeviceID < peer.ID {
-			// We are the offerer
-			if state == peerStateFailed {
-				// Clear stale tracking for retry
-				delete(m.peerSessionIDs, peer.ID)
-				delete(m.peerUfrags, peer.ID)
-				delete(m.failedPeers, peer.ID)
-			} else {
-				// Fresh start: purge stale candidates from server
-				if len(peer.Candidates) > 0 {
-					m.logf("[Overlay-Go] Purging %d stale candidates for peer %s...",
-						len(peer.Candidates), peer.ID)
-					for _, c := range peer.Candidates {
-						sigKey := fmt.Sprintf("%s:%d:%s", c.IP, c.Port, c.Type)
-						m.markSeen(peer.ID, sigKey)
-					}
-				}
-			}
-
-			m.logf("[Overlay-Go] Initiating P2P offer for peer %s (we are offerer)", peer.ID)
-			if err := StartP2POffer(peer.ID); err != nil {
-				m.logf("[Overlay-Go] Failed to start P2P offer for %s: %v", peer.ID, err)
-			} else {
-				m.offeredPeers[peer.ID] = true
-				m.peerStates[peer.ID] = peerStateSDPReceived
-			}
-		} else {
-			m.logf("[Overlay-Go] Waiting for P2P offer from peer %s (they are offerer)", peer.ID)
-		}
-	}
+	m.logf("[Overlay-Go] Automatic P2P offers disabled; using relay until ForceP2POffer is requested")
 }
 
 // ForceP2POffer resets all P2P failure state for a peer and initiates
