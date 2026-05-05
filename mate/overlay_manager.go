@@ -466,15 +466,7 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 		go m.tunReadLoop()
 	}
 
-	// 15. Wait briefly for TUN to stabilize, then initiate P2P offers
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		time.Sleep(2 * time.Second)
-		m.initiateP2POffers()
-	}()
-
-	// 16. Hybrid mode: inject p2p entries into YAML
+	// 15. Hybrid mode: inject p2p entries into YAML
 	if cfg.Mode == "hybrid" && cfg.HybridConfigPath != "" {
 		if err := m.injectHybridYAML(); err != nil {
 			m.logf("[Overlay-Go] Warning: hybrid YAML injection failed: %v", err)
@@ -1609,6 +1601,52 @@ func (m *OverlayManager) initiateP2POffers() {
 	}
 }
 
+// ForceP2POffer resets all P2P failure state for a peer and initiates
+// a fresh WebRTC offer. Used when the user explicitly requests a
+// direct connection upgrade from relay.
+func (m *OverlayManager) ForceP2POffer(peerID string) error {
+	if !m.running.Load() {
+		return fmt.Errorf("overlay not running")
+	}
+
+	m.mu.Lock()
+	peerExists := false
+	for _, p := range m.peers {
+		if p.ID == peerID {
+			peerExists = true
+			break
+		}
+	}
+	if !peerExists {
+		m.mu.Unlock()
+		return fmt.Errorf("peer %s not found", truncateID(peerID))
+	}
+
+	delete(m.peerFailCount, peerID)
+	delete(m.peerCooldownUntil, peerID)
+	delete(m.peerSessionIDs, peerID)
+	delete(m.peerUfrags, peerID)
+	delete(m.failedPeers, peerID)
+	delete(m.offeredPeers, peerID)
+	m.peerStates[peerID] = peerStateIdle
+	m.mu.Unlock()
+
+	m.logf("[Overlay-Go] ForceP2POffer: resetting state for peer %s", truncateID(peerID))
+
+	if err := StartP2POffer(peerID); err != nil {
+		m.logf("[Overlay-Go] ForceP2POffer failed for %s: %v", truncateID(peerID), err)
+		return err
+	}
+
+	m.mu.Lock()
+	m.offeredPeers[peerID] = true
+	m.peerStates[peerID] = peerStateSDPReceived
+	m.mu.Unlock()
+
+	m.logf("[Overlay-Go] ForceP2POffer: P2P offer sent for peer %s", truncateID(peerID))
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Refresh overlay runtime (full peer sync)
 // ---------------------------------------------------------------------------
@@ -1654,8 +1692,8 @@ func (m *OverlayManager) refreshOverlayRuntime() {
 		m.deriveAllPeerKeys()
 	}
 
-	// Re-initiate P2P offers
-	m.initiateP2POffers()
+	// Keep relay as the default transport. Direct P2P is attempted only when
+	// the app explicitly calls ForceP2POffer for a selected peer.
 }
 
 // pruneOverlayState removes signaling state for peers that are no longer in

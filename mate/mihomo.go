@@ -213,6 +213,19 @@ func PingAllOverlayPeers() string {
 	return globalOverlayManager.PingAllPeers()
 }
 
+// ForceP2POffer forces a P2P direct connection attempt for a specific peer.
+// Resets any cooldown/failure state and initiates a fresh WebRTC offer.
+func ForceP2POffer(peerID string) string {
+	if globalOverlayManager == nil || !globalOverlayManager.running.Load() {
+		return fmt.Sprintf(`{"peerID":"%s","error":"overlay not running"}`, peerID)
+	}
+	err := globalOverlayManager.ForceP2POffer(peerID)
+	if err != nil {
+		return fmt.Sprintf(`{"peerID":"%s","error":"%s"}`, peerID, err.Error())
+	}
+	return fmt.Sprintf(`{"peerID":"%s","error":""}`, peerID)
+}
+
 // func Version() string {
 // 	fmt.Printf("Mihomo Meta %s %s %s with %s %s\n",
 // 		C.Version, runtime.GOOS, runtime.GOARCH, runtime.Version(), C.BuildTime)
