@@ -200,6 +200,7 @@ func (m *overlayTransportManager) Send(peerID string, payload []byte) error {
 
 	relayClient, err := m.ensureRelay()
 	if err != nil {
+		m.logf("[OverlayTransport] relay fallback failed for %s: %v", peerID, err)
 		return err
 	}
 

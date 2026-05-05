@@ -52,6 +52,7 @@ var packetPool = sync.Pool{
 // key material fields that Swift collects before calling into Go.
 type OverlayConfig struct {
 	ServerURL        string `json:"serverUrl"`
+	BootstrapURL     string `json:"bootstrapUrl,omitempty"` // violet-next base URL for relay server list
 	AccessToken      string `json:"accessToken"`
 	RefreshToken     string `json:"refreshToken"`
 	LanID            string `json:"lanId"`
@@ -86,9 +87,24 @@ type overlayRegisterRequest struct {
 }
 
 type overlayRegisterResult struct {
-	Device        overlayDeviceRecord `json:"device"`
-	Peers         []overlayPeer       `json:"peers"`
-	RelayEndpoint string              `json:"relayEndpoint"`
+	Device         overlayDeviceRecord `json:"device"`
+	Peers          []overlayPeer       `json:"peers"`
+	RelayEndpoint  string              `json:"relayEndpoint"`
+	RelayRegion    string              `json:"relayRegion,omitempty"`
+	RelayPublicURL string              `json:"relayPublicUrl,omitempty"`
+}
+
+// relayServerEntry represents a relay server from the relay server list API.
+type relayServerEntry struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Region   string `json:"region"`
+	URL      string `json:"url"`
+	Priority int    `json:"priority"`
+}
+
+type relayServerListResponse struct {
+	Servers []relayServerEntry `json:"servers"`
 }
 
 type overlayPeersResponse struct {
@@ -136,6 +152,7 @@ type overlaySnapshot struct {
 	PeerIDs        []string          `json:"peerIds"`
 	ConnectionMode string            `json:"connectionMode"`
 	RelayEndpoint  string            `json:"relayEndpoint,omitempty"`
+	RelayRegion    string            `json:"relayRegion,omitempty"`
 	Peers          []overlayPeerInfo `json:"peers"`
 }
 
@@ -243,6 +260,8 @@ type OverlayManager struct {
 
 	// Relay info
 	relayEndpoint string
+	relayRegion   string
+	relayServers  []relayServerEntry // all known relay servers
 
 	// Transport
 	platform PlatformInterface
@@ -381,8 +400,28 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 
 	// 7. Configure overlay transport (relay)
 	resolvedRelay := resolveRelayEndpoint(regResult.RelayEndpoint, cfg.ServerURL)
+	m.logf("[Overlay-Go] Relay endpoint from registration: raw=%q resolved=%q", regResult.RelayEndpoint, resolvedRelay)
+
+	// 7a. Try multi-region relay selection if bootstrap URL is available
+	relayServers := m.fetchRelayServers()
+	if len(relayServers) > 0 {
+		m.mu.Lock()
+		m.relayServers = relayServers
+		m.mu.Unlock()
+		selectedRelay := m.selectBestRelay(relayServers, resolvedRelay)
+		if selectedRelay != "" {
+			resolvedRelay = selectedRelay
+		}
+	} else if regResult.RelayRegion != "" {
+		m.mu.Lock()
+		m.relayRegion = regResult.RelayRegion
+		m.mu.Unlock()
+	}
+
 	if err := globalOverlayTransport.Configure(resolvedRelay, cfg.AccessToken, m.deviceID); err != nil {
 		m.logf("[Overlay-Go] Warning: overlay transport configure failed: %v", err)
+	} else {
+		m.logf("[Overlay-Go] Overlay transport configured OK (relay=%q)", resolvedRelay)
 	}
 	m.mu.Lock()
 	m.relayEndpoint = resolvedRelay
@@ -576,6 +615,7 @@ func (m *OverlayManager) SnapshotJSON() string {
 		PeerIDs:        peerIDs,
 		ConnectionMode: connectionMode,
 		RelayEndpoint:  m.relayEndpoint,
+		RelayRegion:    m.relayRegion,
 		Peers:          peerInfos,
 	}
 
@@ -1026,6 +1066,144 @@ func (m *OverlayManager) buildRouteTable() {
 		}
 	}
 	m.logf("[Overlay-Go] Route table built: %d entries", len(m.routes))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-region relay selection
+// ---------------------------------------------------------------------------
+
+// fetchRelayServers fetches the list of available relay servers from the
+// bootstrap API (violet-next). Falls back to the registration relay endpoint
+// if the API is unavailable or returns no servers.
+func (m *OverlayManager) fetchRelayServers() []relayServerEntry {
+	bootstrapURL := m.config.BootstrapURL
+	if bootstrapURL == "" {
+		return nil
+	}
+
+	url := strings.TrimRight(bootstrapURL, "/") + "/api/servers/relay"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		m.logf("[Relay-Select] Failed to create relay list request: %v", err)
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+m.config.AccessToken)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		m.logf("[Relay-Select] Failed to fetch relay servers: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		m.logf("[Relay-Select] Relay server list API returned %d", resp.StatusCode)
+		return nil
+	}
+
+	var envelope struct {
+		Success bool                    `json:"success"`
+		Data    relayServerListResponse `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
+		m.logf("[Relay-Select] Failed to decode relay server list: %v", err)
+		return nil
+	}
+	if !envelope.Success || len(envelope.Data.Servers) == 0 {
+		return nil
+	}
+
+	m.logf("[Relay-Select] Fetched %d relay servers", len(envelope.Data.Servers))
+	return envelope.Data.Servers
+}
+
+// probeRelayLatency sends a UDP keepalive packet to a relay endpoint and
+// measures the round-trip time. Returns -1 if the probe fails or times out.
+func (m *OverlayManager) probeRelayLatency(endpoint string) int64 {
+	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
+	if err != nil {
+		return -1
+	}
+
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return -1
+	}
+	defer conn.Close()
+
+	// Build a minimal keepalive packet (just header, no auth needed for latency probe)
+	// We use a simple 34-byte packet with version=0x01, type=keepalive(0x02)
+	probe := make([]byte, 34)
+	probe[0] = 0x01 // version
+	probe[1] = 0x02 // keepalive type
+
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	start := time.Now()
+	if _, err := conn.Write(probe); err != nil {
+		return -1
+	}
+
+	buf := make([]byte, 64)
+	if _, err := conn.Read(buf); err != nil {
+		return -1
+	}
+
+	return time.Since(start).Milliseconds()
+}
+
+// selectBestRelay probes all available relay servers and returns the one with
+// the lowest latency. Falls back to the registration relay endpoint if no
+// servers respond or the list is empty.
+func (m *OverlayManager) selectBestRelay(servers []relayServerEntry, fallbackEndpoint string) string {
+	if len(servers) == 0 {
+		return fallbackEndpoint
+	}
+
+	type probeResult struct {
+		endpoint  string
+		region    string
+		latencyMs int64
+	}
+
+	results := make([]probeResult, len(servers))
+	var wg sync.WaitGroup
+	for i, s := range servers {
+		i, s := i, s
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lat := m.probeRelayLatency(s.URL)
+			results[i] = probeResult{endpoint: s.URL, region: s.Region, latencyMs: lat}
+		}()
+	}
+	wg.Wait()
+
+	bestIdx := -1
+	bestLat := int64(999999)
+	for i, r := range results {
+		if r.latencyMs >= 0 && r.latencyMs < bestLat {
+			bestLat = r.latencyMs
+			bestIdx = i
+		}
+		if r.latencyMs >= 0 {
+			m.logf("[Relay-Select] %s (%s): %dms", r.endpoint, r.region, r.latencyMs)
+		} else {
+			m.logf("[Relay-Select] %s (%s): timeout", r.endpoint, r.region)
+		}
+	}
+
+	if bestIdx >= 0 {
+		chosen := results[bestIdx]
+		m.logf("[Relay-Select] Selected relay: %s (%s, %dms)", chosen.endpoint, chosen.region, chosen.latencyMs)
+		m.mu.Lock()
+		m.relayRegion = chosen.region
+		m.mu.Unlock()
+		return chosen.endpoint
+	}
+
+	m.logf("[Relay-Select] No relay responded, using fallback: %s", fallbackEndpoint)
+	return fallbackEndpoint
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,7 +1783,9 @@ func (m *OverlayManager) wireP2PCallbacks() {
 		case "connecting":
 			// Don't change state if already tracking as sdpReceived
 		case "disconnected":
-			m.logf("[Overlay-Go] P2P disconnected for %s, waiting for recovery...", truncateID(peerID))
+			m.logf("[Overlay-Go] P2P disconnected for %s, resetting state to allow re-negotiation", truncateID(peerID))
+			m.peerStates[peerID] = peerStateFailed
+			m.failedPeers[peerID] = true
 		case "failed":
 			m.peerStates[peerID] = peerStateFailed
 			m.failedPeers[peerID] = true
