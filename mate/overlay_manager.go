@@ -286,6 +286,9 @@ type OverlayManager struct {
 	peerLastPingMs map[string]int64      // peerID -> last measured RTT in ms (-1 = not measured)
 	pendingPings   map[string]pingRecord // nonce-hex -> pending ping
 	pingMu         sync.Mutex
+
+	// Hybrid mode relay for inbound overlay packets addressed to local services.
+	hybridRelay *hybridRelay
 }
 
 type pingRecord struct {
@@ -298,6 +301,13 @@ type pingRecord struct {
 
 // maxSeenPerPeer caps the seenCandidates set per peer to prevent unbounded growth.
 const maxSeenPerPeer = 200
+
+const (
+	hybridOutboundsStart = "# --- Violet Virtual LAN Outbounds BEGIN ---"
+	hybridOutboundsEnd   = "# --- Violet Virtual LAN Outbounds END ---"
+	hybridRulesStart     = "# --- Violet Virtual LAN Rules BEGIN ---"
+	hybridRulesEnd       = "# --- Violet Virtual LAN Rules END ---"
+)
 
 // NewOverlayManager creates a new (stopped) OverlayManager.
 func NewOverlayManager() *OverlayManager {
@@ -441,6 +451,12 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 	// 10. Configure ICE servers
 	m.configureICEServers()
 
+	if cfg.Mode == "hybrid" {
+		m.mu.Lock()
+		m.hybridRelay = newHybridRelay()
+		m.mu.Unlock()
+	}
+
 	// 11. Wire P2P callbacks directly (no Swift round-trip)
 	m.wireP2PCallbacks()
 
@@ -491,6 +507,14 @@ func (m *OverlayManager) Stop() error {
 	// Signal goroutines to stop
 	if m.cancelCh != nil {
 		close(m.cancelCh)
+	}
+
+	m.mu.Lock()
+	relay := m.hybridRelay
+	m.hybridRelay = nil
+	m.mu.Unlock()
+	if relay != nil {
+		relay.close()
 	}
 
 	// Wait for background goroutines to finish
@@ -908,6 +932,22 @@ func (m *OverlayManager) handleInboundPacket(peerID string, payload []byte) {
 
 	// Validate minimum IP packet size
 	if len(decrypted) < 20 {
+		return
+	}
+
+	// Hybrid mode shares the TUN fd with mihomo. Inbound overlay packets must
+	// be answered on the same encrypted overlay transport; writing them to TUN
+	// would send replies through mihomo's p2p outbound and create incompatible
+	// per-connection DataChannels for overlay-only peers.
+	if m.config != nil && m.config.Mode == "hybrid" {
+		m.mu.RLock()
+		relay := m.hybridRelay
+		m.mu.RUnlock()
+		if relay == nil {
+			m.logf("[Overlay-Go] Dropping hybrid inbound packet: relay not initialized")
+			return
+		}
+		relay.relayPacket(peerID, decrypted, m, peerCipher)
 		return
 	}
 
@@ -1640,6 +1680,11 @@ func (m *OverlayManager) refreshOverlayRuntime() {
 	m.buildRouteTable()
 	if peersChanged {
 		m.deriveAllPeerKeys()
+		if m.config != nil && m.config.Mode == "hybrid" && m.config.HybridConfigPath != "" {
+			if err := m.injectHybridYAML(); err != nil {
+				m.logf("[Overlay-Go] Warning: hybrid YAML refresh failed: %v", err)
+			}
+		}
 	}
 
 	// Keep relay as the default transport. Direct P2P is attempted only when
@@ -1860,6 +1905,7 @@ func (m *OverlayManager) injectHybridYAML() error {
 	deviceID := m.deviceID
 	accessToken := m.config.AccessToken
 	serverURL := m.config.ServerURL
+	relayEndpoint := m.relayEndpoint
 	m.mu.RUnlock()
 
 	if hybridConfigPath == "" {
@@ -1873,9 +1919,9 @@ func (m *OverlayManager) injectHybridYAML() error {
 	}
 	proxyYaml := string(yamlBytes)
 
-	// Resolve relay endpoint for YAML injection
-	relayEndpoint := ""
-	if m.httpClient != nil {
+	// Resolve relay endpoint for YAML injection. Prefer the selected runtime
+	// relay; re-register only as a last resort for older startup paths.
+	if relayEndpoint == "" && m.httpClient != nil {
 		regResult, err := m.register()
 		if err == nil {
 			relayEndpoint = resolveRelayEndpoint(regResult.RelayEndpoint, serverURL)
@@ -1889,51 +1935,44 @@ func (m *OverlayManager) injectHybridYAML() error {
 
 	// 1. p2p outbound entries (go into proxies: section)
 	var p2pOutbounds strings.Builder
-	p2pOutbounds.WriteString("\n# --- Virtual LAN Outbounds ---")
+	p2pOutbounds.WriteString("\n" + hybridOutboundsStart)
 	for _, peer := range peers {
-		p2pOutbounds.WriteString(fmt.Sprintf("\n- name: \"p2p-%s\"", truncateID(peer.ID)))
+		proxyName := hybridPeerProxyName(peer.ID)
+		p2pOutbounds.WriteString(fmt.Sprintf("\n- name: \"%s\"", proxyName))
 		p2pOutbounds.WriteString("\n  type: p2p")
 		p2pOutbounds.WriteString(fmt.Sprintf("\n  peer-id: \"%s\"", peer.ID))
 		p2pOutbounds.WriteString(fmt.Sprintf("\n  local-device-id: \"%s\"", deviceID))
 		p2pOutbounds.WriteString(fmt.Sprintf("\n  relay-endpoint: \"%s\"", relayEndpoint))
 		p2pOutbounds.WriteString(fmt.Sprintf("\n  access-token: \"%s\"", accessToken))
 	}
-
-	// 2. overlay proxy-group (goes into proxy-groups: section)
-	var overlayGroup strings.Builder
-	overlayGroup.WriteString("\n# --- Virtual LAN Group ---")
-	overlayGroup.WriteString("\n- name: overlay")
-	overlayGroup.WriteString("\n  type: select")
-	overlayGroup.WriteString("\n  proxies:")
-	for _, peer := range peers {
-		overlayGroup.WriteString(fmt.Sprintf("\n    - \"p2p-%s\"", truncateID(peer.ID)))
-	}
-	overlayGroup.WriteString("\n    - DIRECT")
+	p2pOutbounds.WriteString("\n" + hybridOutboundsEnd)
 
 	// 3. overlay routing rules (goes into rules: section, must be first)
 	var overlayRules strings.Builder
-	overlayRules.WriteString("# --- Virtual LAN Rules ---")
-	overlayRules.WriteString("\n- IP-CIDR,100.96.0.0/12,overlay")
+	overlayRules.WriteString(hybridRulesStart)
+	for _, peer := range peers {
+		if peer.OverlayIP == "" {
+			continue
+		}
+		overlayRules.WriteString(fmt.Sprintf(
+			"\n- IP-CIDR,%s/32,%s,no-resolve",
+			peer.OverlayIP,
+			hybridPeerProxyName(peer.ID),
+		))
+	}
+	overlayRules.WriteString("\n- IP-CIDR,100.96.0.0/12,REJECT,no-resolve")
+	overlayRules.WriteString("\n" + hybridRulesEnd)
 
 	// --- Inject overlay block into YAML ---
+	proxyYaml = removeGeneratedYAMLBlock(proxyYaml, hybridOutboundsStart, hybridOutboundsEnd)
+	proxyYaml = removeGeneratedYAMLBlock(proxyYaml, hybridRulesStart, hybridRulesEnd)
 
 	// a) Insert p2p outbounds at end of proxies: section
 	if idx := strings.Index(proxyYaml, "\nproxy-groups:"); idx >= 0 {
 		proxyYaml = proxyYaml[:idx] + p2pOutbounds.String() + proxyYaml[idx:]
 	}
 
-	// b) Insert overlay group at end of proxy-groups: section.
-	// The YAML order is: proxy-groups → rule-providers → rules.
-	// We must insert before rule-providers (if present), otherwise before rules.
-	insertBeforeGroup := "\nrule-providers:"
-	if !strings.Contains(proxyYaml, insertBeforeGroup) {
-		insertBeforeGroup = "\nrules:"
-	}
-	if idx := strings.Index(proxyYaml, insertBeforeGroup); idx >= 0 {
-		proxyYaml = proxyYaml[:idx] + overlayGroup.String() + proxyYaml[idx:]
-	}
-
-	// c) Insert overlay rules at beginning of rules: section
+	// b) Insert overlay rules at beginning of rules: section.
 	if idx := strings.Index(proxyYaml, "\nrules:"); idx >= 0 {
 		// Find the end of the "rules:" line
 		lineEnd := strings.Index(proxyYaml[idx+1:], "\n")
@@ -2302,6 +2341,32 @@ func truncateID(id string) string {
 		return id
 	}
 	return id[:8]
+}
+
+func hybridPeerProxyName(peerID string) string {
+	return "p2p-" + peerID
+}
+
+func removeGeneratedYAMLBlock(content string, startMarker string, endMarker string) string {
+	for {
+		start := strings.Index(content, startMarker)
+		if start < 0 {
+			return content
+		}
+		end := strings.Index(content[start:], endMarker)
+		if end < 0 {
+			return content
+		}
+		removeStart := start
+		if removeStart > 0 && content[removeStart-1] == '\n' {
+			removeStart--
+		}
+		removeEnd := start + end + len(endMarker)
+		if removeEnd < len(content) && content[removeEnd] == '\n' {
+			removeEnd++
+		}
+		content = content[:removeStart] + content[removeEnd:]
+	}
 }
 
 // truncateStr returns at most maxLen characters of s, appending "..." if truncated.

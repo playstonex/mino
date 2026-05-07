@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	N "github.com/metacubex/mihomo/common/net"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/p2p"
 	"github.com/pion/webrtc/v4"
@@ -50,16 +49,9 @@ func (p *P2P) StreamConn(c net.Conn, metadata *C.Metadata) (net.Conn, error) {
 }
 
 func (p *P2P) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	pc := p2p.GetManager().GetPeer(p.peerID)
-	if pc == nil {
-		// Fallback to relay if WebRTC is not connected
-		rp, err := p.getRelayPacketConn(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("P2P dial: %s: %w", p.peerID, err)
-		}
-		rAddr := &net.UDPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 0}
-		conn := N.NewBindPacketConn(rp, rAddr)
-		return NewConn(conn, p), nil
+	pc, err := p.waitPeer(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("P2P dial: %s: %w", p.peerID, err)
 	}
 
 	ordered := true
@@ -85,13 +77,9 @@ func (p *P2P) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, er
 }
 
 func (p *P2P) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	pc := p2p.GetManager().GetPeer(p.peerID)
-	if pc == nil {
-		rp, err := p.getRelayPacketConn(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("P2P packet: %s: %w", p.peerID, err)
-		}
-		return newPacketConn(rp, p), nil
+	pc, err := p.waitPeer(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("P2P packet: %s: %w", p.peerID, err)
 	}
 
 	ordered := false
@@ -123,6 +111,42 @@ func (p *P2P) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.
 
 func (p *P2P) SupportUOT() bool {
 	return true
+}
+
+func (p *P2P) waitPeer(ctx context.Context) (*webrtc.PeerConnection, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if pc := p2p.GetManager().GetPeer(p.peerID); pc != nil {
+			return pc, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf(
+				"direct WebRTC connection is not ready: %w (known peers: %v)",
+				ctx.Err(),
+				knownP2PPeerIDs(),
+			)
+		case <-ticker.C:
+		}
+	}
+}
+
+func knownP2PPeerIDs() []string {
+	manager := p2p.GetManager()
+	manager.Mu.RLock()
+	defer manager.Mu.RUnlock()
+
+	ids := make([]string, 0, len(manager.Peers))
+	for id := range manager.Peers {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // getPacketConn tries WebRTC first, falls back to relay.
