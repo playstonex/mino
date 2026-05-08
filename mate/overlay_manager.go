@@ -742,7 +742,7 @@ func (m *OverlayManager) decryptPacket(ciphertext []byte, gcm cipher.AEAD) ([]by
 // tunReadLoop reads raw IP packets from the TUN file descriptor (passed from
 // Swift), routes them to the appropriate peer via the overlay transport.
 // This goroutine only runs in pure overlay mode; in hybrid mode mihomo owns
-// the TUN fd and routes overlay traffic through its p2p proxy outbounds.
+// the TUN fd and the sing-tun LinkEndpoint interceptor diverts overlay packets.
 func (m *OverlayManager) tunReadLoop() {
 	defer m.wg.Done()
 
