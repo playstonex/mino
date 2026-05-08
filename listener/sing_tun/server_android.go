@@ -11,7 +11,7 @@ import (
 	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 
-	"github.com/metacubex/sing-tun"
+	"github.com/playstonex/sing-tun"
 )
 
 type packageManagerCallback struct{}

@@ -61,7 +61,7 @@ require (
 	github.com/metacubex/sing-quic v0.0.0-20231130141855-0022295e524b // indirect
 	github.com/metacubex/sing-shadowsocks v0.2.5 // indirect
 	github.com/metacubex/sing-shadowsocks2 v0.1.4 // indirect
-	github.com/metacubex/sing-tun v0.1.15-0.20231103033938-170591e8d5bd // indirect
+	github.com/playstonex/sing-tun v0.1.15-0.20231103033938-170591e8d5bd // indirect
 	github.com/metacubex/sing-vmess v0.1.9-0.20230921005247-a0488d7dac74 // indirect
 	github.com/metacubex/sing-wireguard v0.0.0-20231001110902-321836559170 // indirect
 	github.com/moby/term v0.5.0 // indirect

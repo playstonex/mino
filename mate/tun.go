@@ -4,7 +4,7 @@ import (
 	"net"
 	"net/netip"
 
-	tun "github.com/metacubex/sing-tun"
+	tun "github.com/playstonex/sing-tun"
 	"github.com/metacubex/sing/common"
 	E "github.com/metacubex/sing/common/exceptions"
 )

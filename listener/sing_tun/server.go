@@ -24,7 +24,7 @@ import (
 	"github.com/metacubex/mihomo/log"
 	"golang.org/x/exp/constraints"
 
-	tun "github.com/metacubex/sing-tun"
+	tun "github.com/playstonex/sing-tun"
 	"github.com/metacubex/sing/common"
 	"github.com/metacubex/sing/common/control"
 	E "github.com/metacubex/sing/common/exceptions"
@@ -476,6 +476,7 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 		ForwarderBindInterface: forwarderBindInterface,
 		InterfaceFinder:        interfaceFinder,
 		EnforceBindInterface:   EnforceBindInterface,
+		PacketInterceptor:      C.GetTunPacketInterceptor(),
 	}
 	l.tunIf = tunIf
 

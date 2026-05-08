@@ -8,6 +8,7 @@ import (
 	// "github.com/metacubex/mihomo/config"
 	// "github.com/metacubex/mihomo/service"
 
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/p2p"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
@@ -65,10 +66,12 @@ func Start(config *ServerConfig, platformInterface PlatformInterface) error {
 	// P2P signaling callbacks are wired by the overlay manager when active.
 	// In proxy-only mode, no P2P callbacks are needed.
 
+	C.SetTunPacketInterceptor(globalOverlayManager)
 	SetTunCreator(globalService.plantformWrapper)
 	return globalService.Start()
 }
 func Close() error {
+	C.SetTunPacketInterceptor(nil)
 	globalOverlayTransport.Reset()
 	if globalService != nil {
 		return globalService.Close()
@@ -166,9 +169,8 @@ func StartOverlay(configJSON string, platformInterface PlatformInterface) error 
 	return globalOverlayManager.Start(configJSON, platformInterface)
 }
 
-// MateStartHybrid starts mihomo in hybrid mode (proxy + virtual LAN).
-// Go handles: read base YAML, inject p2p entries, registration,
-// signaling, encryption, packet routing, ICE server config.
+// MateStartHybrid starts the virtual LAN side of hybrid mode.
+// Go handles registration, signaling, encryption, packet routing, and ICE server config.
 // Swift must call applyOverlayNetworkSettings() before this.
 func StartHybrid(configJSON string, platformInterface PlatformInterface) error {
 	return globalOverlayManager.Start(configJSON, platformInterface)
