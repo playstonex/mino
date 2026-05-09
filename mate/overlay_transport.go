@@ -179,8 +179,13 @@ func (m *overlayTransportManager) HasPacketConn(peerID string) bool {
 }
 
 func (m *overlayTransportManager) Send(peerID string, payload []byte) error {
-	if err := m.RegisterPeer(peerID); err != nil {
-		return err
+	m.mu.RLock()
+	_, knownPeer := m.peers[peerID]
+	m.mu.RUnlock()
+	if !knownPeer {
+		if err := m.RegisterPeer(peerID); err != nil {
+			return err
+		}
 	}
 
 	// C1 fix: hold RLock during both packetConn lookup AND WriteTo to prevent
