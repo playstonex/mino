@@ -54,6 +54,9 @@ func AddP2PPeer(peerID string, signalingJSON string) error {
 			if !ok || pc == nil {
 				return fmt.Errorf("no PeerConnection for peer %s to apply answer", peerID)
 			}
+			if m.Logger != nil {
+				m.Logger("[P2P] peer %s: applying remote answer (existing PC reused)", peerID)
+			}
 		} else {
 			// We are the answerer and received an offer.
 			// Create a fresh PeerConnection (destroying old one if any).
@@ -64,6 +67,9 @@ func AddP2PPeer(peerID string, signalingJSON string) error {
 			pc, err = m.NewPeer(peerID)
 			if err != nil {
 				return err
+			}
+			if m.Logger != nil {
+				m.Logger("[P2P] peer %s: created new PC as answerer, applying remote offer", peerID)
 			}
 
 			// Answerer must register OnDataChannel before SetRemoteDescription
@@ -110,6 +116,9 @@ func AddP2PPeer(peerID string, signalingJSON string) error {
 			return fmt.Errorf("no PeerConnection for peer %s to add ICE candidate", peerID)
 		}
 
+		if m.Logger != nil {
+			m.Logger("[P2P] peer %s: adding remote ICE candidate: %s", peerID, truncateStr(msg.Payload, 80))
+		}
 		err := pc.AddICECandidate(webrtc.ICECandidateInit{
 			Candidate: msg.Payload,
 		})
@@ -142,8 +151,25 @@ func (p *p2pUDPPacket) LocalAddr() net.Addr {
 
 // StartP2POffer initiates a P2P connection as an offerer
 func StartP2POffer(peerID string) error {
+	return startP2POfferWithPolicy(peerID, false)
+}
+
+// StartP2POfferRelayOnly initiates a P2P connection using only TURN relay
+// candidates. This is used as a fallback when direct connectivity fails
+// (e.g. due to firewall blocking inbound UDP on the remote peer).
+func StartP2POfferRelayOnly(peerID string) error {
+	return startP2POfferWithPolicy(peerID, true)
+}
+
+func startP2POfferWithPolicy(peerID string, relayOnly bool) error {
 	m := p2p.GetManager()
-	pc, err := m.NewPeer(peerID)
+	var pc *webrtc.PeerConnection
+	var err error
+	if relayOnly {
+		pc, err = m.NewPeerRelay(peerID)
+	} else {
+		pc, err = m.NewPeer(peerID)
+	}
 	if err != nil {
 		return err
 	}

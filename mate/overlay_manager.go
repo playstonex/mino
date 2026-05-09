@@ -1,6 +1,7 @@
 package mate
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -22,6 +23,7 @@ import (
 	"github.com/metacubex/mihomo/transport/p2p"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
+	"golang.org/x/sys/unix"
 )
 
 // ---------------------------------------------------------------------------
@@ -240,6 +242,9 @@ type OverlayManager struct {
 
 	// Per-peer crypto: deviceID -> sharedKey (raw bytes kept for re-derivation check)
 	peerKeys map[string][]byte
+	// Per-peer public keys used for the cached shared keys. If a peer rotates
+	// its keypair, this lets us detect and re-derive instead of reusing stale AEADs.
+	peerPublicKeys map[string]string
 	// Per-peer cached AES-GCM cipher instances — avoids re-creating cipher on every packet.
 	peerCiphers map[string]cipher.AEAD
 
@@ -283,9 +288,10 @@ type OverlayManager struct {
 	debugPacketLog atomic.Bool
 
 	// Ping tracking
-	peerLastPingMs map[string]int64      // peerID -> last measured RTT in ms (-1 = not measured)
-	pendingPings   map[string]pingRecord // nonce-hex -> pending ping
-	pingMu         sync.Mutex
+	peerLastPingMs    map[string]int64      // peerID -> last measured RTT in ms (-1 = not measured)
+	pendingPings      map[string]pingRecord // nonce-hex -> pending ping
+	noCipherLogCounts map[string]int
+	pingMu            sync.Mutex
 }
 
 type pingRecord struct {
@@ -304,6 +310,7 @@ func NewOverlayManager() *OverlayManager {
 	return &OverlayManager{
 		knownPeerIDs:      make(map[string]bool),
 		peerKeys:          make(map[string][]byte),
+		peerPublicKeys:    make(map[string]string),
 		peerCiphers:       make(map[string]cipher.AEAD),
 		peerStates:        make(map[string]peerSignalingState),
 		seenCandidates:    make(map[string]map[string]bool),
@@ -316,6 +323,7 @@ func NewOverlayManager() *OverlayManager {
 		peerFailCount:     make(map[string]int),
 		peerCooldownUntil: make(map[string]time.Time),
 		routes:            make(map[string]string),
+		noCipherLogCounts: make(map[string]int),
 	}
 }
 
@@ -330,6 +338,12 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 	if m.running.Load() {
 		return fmt.Errorf("overlay manager already running")
 	}
+	started := false
+	defer func() {
+		if !started {
+			m.cleanupPartialStart()
+		}
+	}()
 
 	// 1. Parse config
 	var cfg OverlayConfig
@@ -466,7 +480,42 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 		go m.tunReadLoop()
 	}
 
+	started = true
 	return nil
+}
+
+func (m *OverlayManager) cleanupPartialStart() {
+	globalOverlayTransport.Reset()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.config = nil
+	m.httpClient = nil
+	m.platform = nil
+	m.deviceID = ""
+	m.overlayIP = ""
+	m.peers = nil
+	m.knownPeerIDs = make(map[string]bool)
+	m.routes = make(map[string]string)
+	m.peerKeys = make(map[string][]byte)
+	m.peerPublicKeys = make(map[string]string)
+	m.peerCiphers = make(map[string]cipher.AEAD)
+	m.peerStates = make(map[string]peerSignalingState)
+	m.seenCandidates = make(map[string]map[string]bool)
+	m.peerUfrags = make(map[string]string)
+	m.peerSessionIDs = make(map[string]string)
+	m.offeredPeers = make(map[string]bool)
+	m.failedPeers = make(map[string]bool)
+	m.peerFailCount = make(map[string]int)
+	m.peerCooldownUntil = make(map[string]time.Time)
+	m.relayEndpoint = ""
+	m.relayRegion = ""
+	m.relayServers = nil
+	m.peerLastPingMs = make(map[string]int64)
+	m.noCipherLogCounts = make(map[string]int)
+	m.pingMu.Lock()
+	m.pendingPings = make(map[string]pingRecord)
+	m.pingMu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
@@ -519,9 +568,11 @@ func (m *OverlayManager) Stop() error {
 	m.knownPeerIDs = make(map[string]bool)
 	m.routes = make(map[string]string)
 	m.peerKeys = make(map[string][]byte)
+	m.peerPublicKeys = make(map[string]string)
 	m.peerCiphers = make(map[string]cipher.AEAD)
 	m.seenCandidates = make(map[string]map[string]bool)
 	m.peerLastPingMs = make(map[string]int64)
+	m.noCipherLogCounts = make(map[string]int)
 	m.mu.Unlock()
 
 	// Clear pending pings
@@ -665,15 +716,17 @@ func (m *OverlayManager) deriveAllPeerKeys() {
 	defer m.mu.Unlock()
 
 	newKeys := make(map[string][]byte, len(m.peers))
+	newPublicKeys := make(map[string]string, len(m.peers))
 	newCiphers := make(map[string]cipher.AEAD, len(m.peers))
 	for _, peer := range m.peers {
 		if peer.PublicKey == "" {
 			continue
 		}
 		// Reuse existing key if peer's public key hasn't changed.
-		if existingKey, ok := m.peerKeys[peer.ID]; ok {
+		if existingKey, ok := m.peerKeys[peer.ID]; ok && m.peerPublicKeys[peer.ID] == peer.PublicKey {
 			if existingCipher, cok := m.peerCiphers[peer.ID]; cok {
 				newKeys[peer.ID] = existingKey
+				newPublicKeys[peer.ID] = peer.PublicKey
 				newCiphers[peer.ID] = existingCipher
 				continue
 			}
@@ -689,10 +742,12 @@ func (m *OverlayManager) deriveAllPeerKeys() {
 			continue
 		}
 		newKeys[peer.ID] = key
+		newPublicKeys[peer.ID] = peer.PublicKey
 		newCiphers[peer.ID] = gcm
 		m.logf("[Overlay-Go] Derived shared key for peer %s", peer.ID)
 	}
 	m.peerKeys = newKeys
+	m.peerPublicKeys = newPublicKeys
 	m.peerCiphers = newCiphers
 }
 
@@ -756,15 +811,25 @@ func (m *OverlayManager) tunReadLoop() {
 	lastLogTime := time.Now()
 
 	for m.running.Load() {
+		ready, err := waitForTunReadable(m.tunFd, 500)
+		if err != nil {
+			if m.running.Load() {
+				m.logf("[Overlay-Go] TUN poll error: %v", err)
+			}
+			return
+		}
+		if !ready {
+			continue
+		}
+
 		bufPtr := tunReadPool.Get().(*[]byte)
 		buf := *bufPtr
 
 		n, err := syscall.Read(m.tunFd, buf)
 		if err != nil {
 			tunReadPool.Put(bufPtr)
-			// EAGAIN on non-blocking fd is not fatal — just retry.
+			// EAGAIN on non-blocking fd is not fatal — poll again.
 			if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 			if m.running.Load() {
@@ -853,6 +918,30 @@ func (m *OverlayManager) tunReadLoop() {
 	}
 }
 
+func waitForTunReadable(fd int, timeoutMs int) (bool, error) {
+	fds := []unix.PollFd{{
+		Fd:     int32(fd),
+		Events: unix.POLLIN,
+	}}
+
+	n, err := unix.Poll(fds, timeoutMs)
+	if err == unix.EINTR {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
+	}
+
+	revents := fds[0].Revents
+	if revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+		return false, fmt.Errorf("tun fd poll revents=%#x", revents)
+	}
+	return revents&unix.POLLIN != 0, nil
+}
+
 // writeToTUN writes a raw IP packet to the TUN file descriptor.
 // On macOS/iOS utun devices, a 4-byte protocol family header must be
 // prepended (AF_INET=2 for IPv4, AF_INET6=30 for IPv6) in host byte order.
@@ -866,9 +955,9 @@ func (m *OverlayManager) writeToTUN(packet []byte) error {
 
 	version := (packet[0] >> 4) & 0x0F
 	if version == 6 {
-		binary.LittleEndian.PutUint32(buf[:4], 30) // AF_INET6
+		binary.NativeEndian.PutUint32(buf[:4], 30) // AF_INET6
 	} else {
-		binary.LittleEndian.PutUint32(buf[:4], 2) // AF_INET
+		binary.NativeEndian.PutUint32(buf[:4], 2) // AF_INET
 	}
 	copy(buf[4:], packet)
 	_, err := syscall.Write(m.tunFd, buf[:4+len(packet)])
@@ -888,7 +977,13 @@ func (m *OverlayManager) handleInboundPacket(peerID string, payload []byte) {
 	m.mu.RUnlock()
 
 	if !ok {
-		m.logf("[Overlay-Go] No cipher for inbound packet from %s", peerID)
+		m.mu.Lock()
+		m.noCipherLogCounts[peerID]++
+		count := m.noCipherLogCounts[peerID]
+		m.mu.Unlock()
+		if count <= 3 || count%100 == 0 {
+			m.logf("[Overlay-Go] No cipher for inbound packet from %s (count=%d)", peerID, count)
+		}
 		return
 	}
 
@@ -907,6 +1002,19 @@ func (m *OverlayManager) handleInboundPacket(peerID string, payload []byte) {
 	// Validate minimum IP packet size
 	if len(decrypted) < 20 {
 		return
+	}
+
+	// In hybrid mode, rewrite the destination IP from our overlay IP (100.96.x.y)
+	// back to the mihomo TUN address (198.18.0.1). This completes the symmetric
+	// NAT: outbound rewrites source 198.18.0.1→overlay, inbound rewrites
+	// destination overlay→198.18.0.1. Without this, the TCP stack drops replies
+	// because the socket is bound to 198.18.0.1 but receives packets for 100.96.x.y.
+	m.mu.RLock()
+	cfg := m.config
+	localIP := m.overlayIP
+	m.mu.RUnlock()
+	if cfg != nil && cfg.Mode == "hybrid" {
+		decrypted = rewriteHybridOverlayDestination(decrypted, localIP)
 	}
 
 	// Write to TUN fd
@@ -995,7 +1103,7 @@ func (m *OverlayManager) sendRequest(method, path string, body interface{}, resu
 		if err != nil {
 			return fmt.Errorf("marshal request body: %w", err)
 		}
-		bodyReader = strings.NewReader(string(bodyBytes))
+		bodyReader = bytes.NewReader(bodyBytes)
 	}
 
 	url := strings.TrimRight(m.config.ServerURL, "/") + "/" + path
@@ -1130,8 +1238,9 @@ func (m *OverlayManager) probeRelayLatency(endpoint string) int64 {
 	}
 	defer conn.Close()
 
-	// Build a minimal keepalive packet (just header, no auth needed for latency probe)
-	// We use a simple 34-byte packet with version=0x01, type=keepalive(0x02)
+	// Relay probe protocol: the relay treats a 34-byte UDP packet with
+	// version=0x01 and type=keepalive(0x02) as an unauthenticated latency
+	// probe and echoes a response. Keep this in sync with the relay service.
 	probe := make([]byte, 34)
 	probe[0] = 0x01 // version
 	probe[1] = 0x02 // keepalive type
@@ -1166,11 +1275,14 @@ func (m *OverlayManager) selectBestRelay(servers []relayServerEntry, fallbackEnd
 
 	results := make([]probeResult, len(servers))
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, min(len(servers), 8))
 	for i, s := range servers {
 		i, s := i, s
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			lat := m.probeRelayLatency(s.URL)
 			results[i] = probeResult{endpoint: s.URL, region: s.Region, latencyMs: lat}
 		}()
@@ -1592,7 +1704,69 @@ func (m *OverlayManager) ForceP2POffer(peerID string) error {
 	m.mu.Unlock()
 
 	m.logf("[Overlay-Go] ForceP2POffer: P2P offer sent for peer %s", truncateID(peerID))
+
+	// Schedule a relay-only fallback attempt if the initial P2P offer fails.
+	// After 15 seconds, if the peer is still not connected, retry with
+	// ICETransportPolicy=relay to bypass firewall/NAT issues via TURN.
+	go m.scheduleRelayFallback(peerID)
+
 	return nil
+}
+
+// scheduleRelayFallback waits for the initial P2P attempt to either succeed
+// or fail, then retries with relay-only ICE transport policy if needed.
+func (m *OverlayManager) scheduleRelayFallback(peerID string) {
+	// Wait 15 seconds for the initial attempt to complete
+	timer := time.NewTimer(15 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-m.cancelCh:
+		return
+	}
+
+	if !m.running.Load() {
+		return
+	}
+
+	m.mu.RLock()
+	state := m.peerStates[peerID]
+	m.mu.RUnlock()
+
+	// If already connected, no fallback needed
+	if state == peerStateConnected {
+		return
+	}
+
+	// Check if DataChannel is already open (connection may have succeeded
+	// but state tracking lagged)
+	if globalOverlayTransport.HasPacketConn(peerID) {
+		return
+	}
+
+	m.logf("[Overlay-Go] P2P direct attempt timed out for %s (state=%s), retrying with TURN relay-only",
+		truncateID(peerID), state)
+
+	// Reset state for retry
+	m.mu.Lock()
+	delete(m.peerSessionIDs, peerID)
+	delete(m.peerUfrags, peerID)
+	delete(m.failedPeers, peerID)
+	m.peerStates[peerID] = peerStateIdle
+	m.mu.Unlock()
+
+	if err := StartP2POfferRelayOnly(peerID); err != nil {
+		m.logf("[Overlay-Go] ForceP2POffer relay-only fallback failed for %s: %v", truncateID(peerID), err)
+		return
+	}
+
+	m.mu.Lock()
+	m.offeredPeers[peerID] = true
+	m.peerStates[peerID] = peerStateSDPReceived
+	m.mu.Unlock()
+
+	m.logf("[Overlay-Go] ForceP2POffer: relay-only P2P offer sent for peer %s (TURN fallback)", truncateID(peerID))
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,7 +1997,8 @@ func (m *OverlayManager) configureICEServers() {
 		}
 	}
 
-	// Default fallback: hardcoded servers
+	// Default fallback: public STUN only. TURN credentials must come from
+	// the app-provided ICE server config so they can be rotated server-side.
 	iceConfig := `[` +
 		`{"urls":["stun:stun.l.google.com:19302"]},` +
 		`{"urls":["stun:stun1.l.google.com:19302"]},` +
@@ -1831,14 +2006,13 @@ func (m *OverlayManager) configureICEServers() {
 		`{"urls":["stun:stun.qq.com:3478"]},` +
 		`{"urls":["stun:stun.aliyun.com:3478"]},` +
 		`{"urls":["stun:stun.miwifi.com:3478"]},` +
-		`{"urls":["stun:stun.syncthing.net:3478"]},` +
-		`{"urls":["turn:ctus.playstone.info:3478?transport=udp"],"username":"bigbig","credential":"123qwe"}` +
+		`{"urls":["stun:stun.syncthing.net:3478"]}` +
 		`]`
 
 	if err := SetICEServersJSON(iceConfig); err != nil {
 		m.logf("[Overlay-Go] Failed to configure ICE servers: %v", err)
 	} else {
-		m.logf("[Overlay-Go] ICE servers configured (7 STUN + 1 TURN)")
+		m.logf("[Overlay-Go] ICE servers configured (7 STUN)")
 	}
 }
 
@@ -1919,15 +2093,19 @@ func (m *OverlayManager) autoPingAllPeers() {
 	}
 	m.mu.RUnlock()
 
-	for _, pid := range peerIDs {
-		pid := pid
-		go func() {
-			// Build and send ping, wait up to 3s (shorter than manual ping)
+	if len(peerIDs) == 0 {
+		return
+	}
+
+	go func(peerIDs []string) {
+		pending := make(map[string]string, len(peerIDs))
+
+		for _, pid := range peerIDs {
 			ping := make([]byte, overlayPingSize)
 			ping[0] = overlayControlPrefix
 			ping[1] = overlayPingType
 			if _, err := rand.Read(ping[2:]); err != nil {
-				return
+				continue
 			}
 			nonceHex := fmt.Sprintf("%x", ping[2:overlayPingSize])
 			now := time.Now()
@@ -1937,33 +2115,41 @@ func (m *OverlayManager) autoPingAllPeers() {
 			m.pingMu.Unlock()
 
 			m.sendControlPacket(pid, ping)
+			pending[nonceHex] = pid
+		}
 
-			// Wait up to 3s for pong
-			deadline := time.After(3 * time.Second)
-			tick := time.NewTicker(20 * time.Millisecond)
-			defer tick.Stop()
-			for {
-				select {
-				case <-deadline:
-					m.pingMu.Lock()
+		if len(pending) == 0 {
+			return
+		}
+
+		deadline := time.NewTimer(3 * time.Second)
+		tick := time.NewTicker(50 * time.Millisecond)
+		defer deadline.Stop()
+		defer tick.Stop()
+
+		for len(pending) > 0 {
+			select {
+			case <-deadline.C:
+				m.pingMu.Lock()
+				for nonceHex, pid := range pending {
 					delete(m.pendingPings, nonceHex)
-					m.pingMu.Unlock()
-					// Mark as timeout (-1)
 					m.mu.Lock()
 					m.peerLastPingMs[pid] = -1
 					m.mu.Unlock()
-					return
-				case <-tick.C:
-					m.pingMu.Lock()
-					_, pending := m.pendingPings[nonceHex]
-					m.pingMu.Unlock()
-					if !pending {
-						return // pong received
+				}
+				m.pingMu.Unlock()
+				return
+			case <-tick.C:
+				m.pingMu.Lock()
+				for nonceHex := range pending {
+					if _, ok := m.pendingPings[nonceHex]; !ok {
+						delete(pending, nonceHex)
 					}
 				}
+				m.pingMu.Unlock()
 			}
-		}()
-	}
+		}
+	}(peerIDs)
 }
 
 // PingPeer sends a ping probe to the specified peer and returns the result

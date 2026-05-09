@@ -113,6 +113,17 @@ func (m *Manager) logf(format string, args ...any) {
 }
 
 func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
+	return m.NewPeerWithPolicy(peerID, webrtc.ICETransportPolicyAll)
+}
+
+// NewPeerRelay creates a PeerConnection that only uses TURN relay candidates.
+// Use this as a fallback when direct connectivity (host/srflx) fails, e.g.
+// due to firewall blocking inbound UDP.
+func (m *Manager) NewPeerRelay(peerID string) (*webrtc.PeerConnection, error) {
+	return m.NewPeerWithPolicy(peerID, webrtc.ICETransportPolicyRelay)
+}
+
+func (m *Manager) NewPeerWithPolicy(peerID string, policy webrtc.ICETransportPolicy) (*webrtc.PeerConnection, error) {
 	// Close any existing PeerConnection for this peer to prevent leaks
 	// when retrying after a failure.
 	m.RemovePeer(peerID)
@@ -129,12 +140,30 @@ func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
 			{URLs: []string{"stun:stun.aliyun.com:3478"}},
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 			{URLs: []string{"stun:stun1.l.google.com:19302"}},
-			{URLs: []string{"turn:ctus.playstone.info:3478?transport=udp"}, Username: "bigbig", Credential: "123qwe"},
 		}
 	}
 
+	// Check if any TURN server is configured (needed for relay-only policy)
+	hasTURN := false
+	for _, s := range servers {
+		for _, u := range s.URLs {
+			if strings.HasPrefix(u, "turn:") || strings.HasPrefix(u, "turns:") {
+				hasTURN = true
+				break
+			}
+		}
+		if hasTURN {
+			break
+		}
+	}
+	if policy == webrtc.ICETransportPolicyRelay && !hasTURN {
+		m.logf("[P2P] peer %s: relay-only policy requested but no TURN servers configured, falling back to all", peerID)
+		policy = webrtc.ICETransportPolicyAll
+	}
+
 	config := webrtc.Configuration{
-		ICEServers: servers,
+		ICEServers:         servers,
+		ICETransportPolicy: policy,
 	}
 
 	// Exclude TUN interfaces from ICE candidate gathering.
@@ -155,6 +184,10 @@ func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
 		return nil, err
 	}
 
+	if policy == webrtc.ICETransportPolicyRelay {
+		m.logf("[P2P] peer %s: using relay-only ICE transport policy (TURN fallback)", peerID)
+	}
+
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			m.logf("[P2P] peer %s: ICE gathering complete", peerID)
@@ -163,10 +196,11 @@ func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
 		// Filter out overlay/tunnel interface candidates that can never
 		// reach the remote peer and only waste ICE connectivity checks.
 		if shouldFilterCandidateAddr(c.Address) {
-			m.logf("[P2P] peer %s: filtered tunnel candidate %s", peerID, c.Address)
+			m.logf("[P2P] peer %s: filtered tunnel candidate %s (type=%s)", peerID, c.Address, c.Typ.String())
 			return
 		}
-		m.logf("[P2P] peer %s: local ICE candidate: %s", peerID, c.ToJSON().Candidate)
+		m.logf("[P2P] peer %s: local ICE candidate: type=%s addr=%s:%d protocol=%s",
+			peerID, c.Typ.String(), c.Address, c.Port, c.Protocol.String())
 		if m.OnLocalCandidate != nil {
 			m.OnLocalCandidate(peerID, c.ToJSON().Candidate)
 		}
@@ -183,6 +217,10 @@ func (m *Manager) NewPeer(peerID string) (*webrtc.PeerConnection, error) {
 			m.OnConnectionStateChange(peerID, stateStr)
 		}
 		if s == webrtc.PeerConnectionStateFailed {
+			// Log ICE connection state for diagnostics
+			if iceState := pc.ICEConnectionState(); iceState != webrtc.ICEConnectionStateNew {
+				m.logf("[P2P] peer %s: ICE connection state at failure: %s", peerID, iceState.String())
+			}
 			// Only remove this specific PeerConnection. If a new PC was already
 			// created for the same peerID (retry), we must not close it.
 			m.closePeerIfCurrent(peerID, pc)
@@ -452,6 +490,11 @@ func shouldFilterCandidateAddr(addr string) bool {
 	ip := net.ParseIP(addr)
 	if ip == nil {
 		return false
+	}
+
+	// Filter loopback and link-local (unreachable by remote peers)
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
 	}
 
 	// --- IPv4 ranges ---
