@@ -167,20 +167,35 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 		}
 		proxy, err = outbound.NewMasque(*masqueOption)
 	case "trusttunnel":
-	        trustTunnelOption := &outbound.TrustTunnelOption{BasicOption: basicOption}
-	        err = decoder.Decode(mapping, trustTunnelOption)
-	        if err != nil {
-	                break
-	        }
-	        proxy, err = outbound.NewTrustTunnel(*trustTunnelOption)
+		trustTunnelOption := &outbound.TrustTunnelOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, trustTunnelOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewTrustTunnel(*trustTunnelOption)
+	case "openvpn":
+		openVPNOption := &outbound.OpenVPNOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, openVPNOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewOpenVPN(*openVPNOption)
+	case "tailscale":
+		tailscaleOption := &outbound.TailscaleOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, tailscaleOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewTailscale(*tailscaleOption)
 	case "p2p":
-	        p2pOption := &outbound.P2POption{BasicOption: basicOption}
-	        err = decoder.Decode(mapping, p2pOption)
-	        if err != nil {
-	                break
-	        }
-	        proxy, err = outbound.NewP2P(*p2pOption)
-	default:		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
+		p2pOption := &outbound.P2POption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, p2pOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewP2P(*p2pOption)
+	default:
+		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}
 
 	if err != nil {

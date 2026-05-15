@@ -33,7 +33,7 @@ type ProtocolConfig struct {
 	PaddingMax int
 
 	// EnablePureDownlink enables the pure Sudoku downlink mode.
-	// When false, the connection uses the bandwidth-optimized packed downlink (requires AEAD).
+	// When false, the connection uses the bandwidth-optimized packed downlink.
 	EnablePureDownlink bool
 
 	// Client-only: final target "host:port".
@@ -99,10 +99,6 @@ func (c *ProtocolConfig) Validate() error {
 	}
 	if c.PaddingMax < c.PaddingMin {
 		return fmt.Errorf("padding-max (%d) must be >= padding-min (%d)", c.PaddingMax, c.PaddingMin)
-	}
-
-	if !c.EnablePureDownlink && c.AEADMethod == "none" {
-		return fmt.Errorf("bandwidth optimized downlink requires AEAD")
 	}
 
 	if c.HandshakeTimeoutSeconds < 0 {
@@ -195,14 +191,11 @@ func ResolvePadding(min, max *int, defMin, defMax int) (int, int) {
 }
 
 func NormalizeTableType(tableType string) (string, error) {
-	switch t := strings.ToLower(strings.TrimSpace(tableType)); t {
-	case "", "prefer_ascii":
-		return "prefer_ascii", nil
-	case "prefer_entropy":
-		return "prefer_entropy", nil
-	default:
-		return "", fmt.Errorf("table-type must be prefer_ascii or prefer_entropy")
+	normalized, err := sudoku.NormalizeASCIIMode(tableType)
+	if err != nil {
+		return "", fmt.Errorf("table-type must be prefer_ascii, prefer_entropy, up_ascii_down_entropy, or up_entropy_down_ascii")
 	}
+	return normalized, nil
 }
 
 func (c *ProtocolConfig) tableCandidates() []*sudoku.Table {

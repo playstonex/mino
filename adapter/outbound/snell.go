@@ -101,8 +101,7 @@ func (s *Snell) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn
 }
 
 // ListenPacketContext implements C.ProxyAdapter
-func (s *Snell) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	var err error
+func (s *Snell) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
 	if err = s.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
@@ -110,6 +109,10 @@ func (s *Snell) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (
 	if err != nil {
 		return nil, err
 	}
+
+	defer func(c net.Conn) {
+		safeConnClose(c, err)
+	}(c)
 
 	c, err = s.StreamConnContext(ctx, c, metadata)
 
@@ -161,18 +164,18 @@ func NewSnell(option SnellOption) (*Snell, error) {
 	}
 
 	s := &Snell{
-		Base: &Base{
-			name:   option.Name,
-			addr:   addr,
-			tp:     C.Snell,
-			pdName: option.ProviderName,
-			udp:    option.UDP,
-			tfo:    option.TFO,
-			mpTcp:  option.MPTCP,
-			iface:  option.Interface,
-			rmark:  option.RoutingMark,
-			prefer: option.IPVersion,
-		},
+		Base: NewBase(BaseOption{
+			Name:         option.Name,
+			Addr:         addr,
+			Type:         C.Snell,
+			ProviderName: option.ProviderName,
+			UDP:          option.UDP,
+			TFO:          option.TFO,
+			MPTCP:        option.MPTCP,
+			Interface:    option.Interface,
+			RoutingMark:  option.RoutingMark,
+			Prefer:       option.IPVersion,
+		}),
 		option:     &option,
 		psk:        psk,
 		obfsOption: obfsOption,
