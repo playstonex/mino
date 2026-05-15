@@ -187,6 +187,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewTailscale(*tailscaleOption)
+	case "openconnect":
+		openconnectOption := &outbound.OpenConnectOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, openconnectOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewOpenConnect(*openconnectOption)
 	case "p2p":
 		p2pOption := &outbound.P2POption{BasicOption: basicOption}
 		err = decoder.Decode(mapping, p2pOption)

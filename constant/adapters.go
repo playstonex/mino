@@ -49,6 +49,7 @@ const (
 	TrustTunnel
 	OpenVPN
 	Tailscale
+	OpenConnect
 	P2P
 )
 
@@ -225,6 +226,8 @@ func (at AdapterType) String() string {
 		return "OpenVPN"
 	case Tailscale:
 		return "Tailscale"
+	case OpenConnect:
+		return "OpenConnect"
 	case P2P:
 		return "P2P"
 	case Relay:
