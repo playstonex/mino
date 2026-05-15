@@ -196,13 +196,13 @@ func main() {
 			}
 		}()
 	}
+	defer executor.Shutdown()
+
 	if postUp != "" {
 		if _, err := cmd.ExecShell(postUp); err != nil {
 			log.Fatalln("post-up script error: %s", err.Error())
 		}
 	}
-
-	defer executor.Shutdown()
 
 	termSign := make(chan os.Signal, 1)
 	hupSign := make(chan os.Signal, 1)

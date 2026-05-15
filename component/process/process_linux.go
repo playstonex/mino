@@ -141,9 +141,6 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
 
 		response := (*inetDiagResponse)(unsafe.Pointer(&msg.Data[0]))
 
-		// always set to allow fallback when check fails
-		uid, inode, err = response.UID, response.INode, nil
-
 		// check src port
 		if binary.BigEndian.Uint16(response.SrcPort[:]) != uint16(srcPort) {
 			continue
@@ -167,7 +164,7 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
 			continue
 		}
 
-		// this is the one we want
+		uid, inode, err = response.UID, response.INode, nil
 		break
 	}
 
