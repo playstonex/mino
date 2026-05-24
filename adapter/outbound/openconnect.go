@@ -224,16 +224,25 @@ func (o *OpenConnect) run(ctx context.Context) error {
 	o.running = true
 	log.Debugln("[OpenConnect](%s) tunnel established: vpn-ip=%s mtu=%d", o.name, prefix, mtu)
 
-	if o.option.RemoteDnsResolve && len(o.option.Dns) > 0 && o.resolver == nil {
-		nss, err := dns.ParseNameServer(o.option.Dns)
-		if err == nil {
-			for i := range nss {
-				nss[i].ProxyAdapter = o
+	if o.option.RemoteDnsResolve && o.resolver == nil {
+		dnsServers := o.option.Dns
+		// Fall back to DNS servers provided by the OpenConnect server.
+		if len(dnsServers) == 0 {
+			for _, d := range tunnel.DNS() {
+				dnsServers = append(dnsServers, d)
 			}
-			o.resolver = dns.NewResolver(dns.Config{
-				Main: nss,
-				IPv6: false,
-			})
+		}
+		if len(dnsServers) > 0 {
+			nss, err := dns.ParseNameServer(dnsServers)
+			if err == nil {
+				for i := range nss {
+					nss[i].ProxyAdapter = o
+				}
+				o.resolver = dns.NewResolver(dns.Config{
+					Main: nss,
+					IPv6: false,
+				})
+			}
 		}
 	}
 

@@ -54,11 +54,12 @@ func NewTunnel(ctx context.Context, cfg TunnelConfig, dialer func(ctx context.Co
 	if mtu <= 0 {
 		mtu = 1399
 	}
-	baseCfg := &base.ClientConfig{
-		InsecureSkipVerify: cfg.SkipCertVerify,
-		CiscoCompat:        cfg.CiscoCompat,
-		NoDTLS:             cfg.NoDTLS,
-		BaseMTU:            mtu,
+	baseCfg := base.NewClientConfig() // applies defaults (AgentVersion, CiscoCompat, etc.)
+	baseCfg.InsecureSkipVerify = cfg.SkipCertVerify
+	baseCfg.NoDTLS = cfg.NoDTLS
+	baseCfg.BaseMTU = mtu
+	if !cfg.CiscoCompat {
+		baseCfg.CiscoCompat = false
 	}
 	base.Cfg = baseCfg
 	base.LocalInterface = &base.Interface{}
@@ -71,6 +72,14 @@ func NewTunnel(ctx context.Context, cfg TunnelConfig, dialer func(ctx context.Co
 		rawConn, err := dialer(ctx, network, addr)
 		if err != nil {
 			return nil, fmt.Errorf("openconnect dial: %w", err)
+		}
+		// Ensure ServerName is set for TLS verification when not skipping cert verify.
+		if config.ServerName == "" && !config.InsecureSkipVerify {
+			host, _, _ := net.SplitHostPort(addr)
+			if host != "" {
+				config = config.Clone()
+				config.ServerName = host
+			}
 		}
 		tlsConn := tls.Client(rawConn, config)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -116,19 +125,37 @@ func (t *Tunnel) ReadPacket() ([]byte, error) {
 			return nil, nil
 		}
 		return pl.Data, nil
+	case <-t.cSess.CloseChan:
+		return nil, net.ErrClosed
 	case <-t.closeChan:
 		return nil, net.ErrClosed
 	}
 }
 
 func (t *Tunnel) WritePacket(data []byte) error {
+	// Allocate buffer with room for the 8-byte CSTP header that payloadOutTLSToServer prepends.
+	buf := make([]byte, len(data)+8)
+	copy(buf, data)
 	pl := &proto.Payload{
 		Type: 0x00,
-		Data: data,
+		Data: buf[:len(data)],
+	}
+	// Prefer DTLS when connected (lower latency), fall back to TLS.
+	if t.cSess.DtlsConnected.Load() {
+		select {
+		case t.cSess.PayloadOutDTLS <- pl:
+			return nil
+		case <-t.cSess.CloseChan:
+			return net.ErrClosed
+		case <-t.closeChan:
+			return net.ErrClosed
+		}
 	}
 	select {
 	case t.cSess.PayloadOutTLS <- pl:
 		return nil
+	case <-t.cSess.CloseChan:
+		return net.ErrClosed
 	case <-t.closeChan:
 		return net.ErrClosed
 	}
