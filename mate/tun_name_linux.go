@@ -12,7 +12,7 @@ func getTunnelName(fd int32) (string, error) {
 	// On Linux/Android, use TUNGETIFF ioctl to get the interface name
 	// from the TUN file descriptor.
 	const TUNGETIFF = 0x800454d2 // linux/if_tun.h
-	var ifr [32]byte // struct ifreq: 16 bytes name + padding
+	var ifr [32]byte             // struct ifreq: 16 bytes name + padding
 	_, _, errno := syscall.Syscall(
 		syscall.SYS_IOCTL,
 		uintptr(fd),

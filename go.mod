@@ -3,7 +3,7 @@ module github.com/metacubex/mihomo
 go 1.24.2
 
 require (
-	github.com/WarrDoge/sslcon v0.0.0-00010101000000-000000000000
+	github.com/WarrDoge/sslcon v0.1.0
 	github.com/bahlo/generic-list-go v0.2.0
 	github.com/coreos/go-iptables v0.8.0
 	github.com/dlclark/regexp2 v1.12.0
@@ -171,4 +171,4 @@ require (
 // for https://github.com/golang/protobuf/issues/1704
 replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20260306035419-7ceee0674686
 
-replace github.com/WarrDoge/sslcon => /Volumes/y/lei/Projects/loyang/Violet/extend/sslcon
+replace github.com/WarrDoge/sslcon => ./transport/openconnect/sslcon

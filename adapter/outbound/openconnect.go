@@ -25,6 +25,7 @@ import (
 type OpenConnect struct {
 	*Base
 	tunDevice wireguard.Device
+	tunnel    *oc.Tunnel
 	resolver  resolver.Resolver
 	option    OpenConnectOption
 
@@ -150,9 +151,14 @@ func (o *OpenConnect) Close() error {
 	}
 	o.runMutex.Lock()
 	tunDevice := o.tunDevice
+	tunnel := o.tunnel
 	o.tunDevice = nil
+	o.tunnel = nil
 	o.running = false
 	o.runMutex.Unlock()
+	if tunnel != nil {
+		_ = tunnel.Close()
+	}
 	if tunDevice != nil {
 		return tunDevice.Close()
 	}
@@ -220,10 +226,7 @@ func (o *OpenConnect) run(ctx context.Context) error {
 		return err
 	}
 
-	o.tunDevice = tunDevice
-	o.running = true
-	log.Debugln("[OpenConnect](%s) tunnel established: vpn-ip=%s mtu=%d", o.name, prefix, mtu)
-
+	var remoteResolver resolver.Resolver
 	if o.option.RemoteDnsResolve && o.resolver == nil {
 		dnsServers := o.option.Dns
 		// Fall back to DNS servers provided by the OpenConnect server.
@@ -234,17 +237,28 @@ func (o *OpenConnect) run(ctx context.Context) error {
 		}
 		if len(dnsServers) > 0 {
 			nss, err := dns.ParseNameServer(dnsServers)
-			if err == nil {
-				for i := range nss {
-					nss[i].ProxyAdapter = o
-				}
-				o.resolver = dns.NewResolver(dns.Config{
-					Main: nss,
-					IPv6: false,
-				})
+			if err != nil {
+				tunnel.Close()
+				_ = tunDevice.Close()
+				return fmt.Errorf("openconnect: parse remote DNS: %w", err)
 			}
+			for i := range nss {
+				nss[i].ProxyAdapter = o
+			}
+			remoteResolver = dns.NewResolver(dns.Config{
+				Main: nss,
+				IPv6: false,
+			})
 		}
 	}
+
+	o.tunDevice = tunDevice
+	o.tunnel = tunnel
+	if remoteResolver != nil {
+		o.resolver = remoteResolver
+	}
+	o.running = true
+	log.Debugln("[OpenConnect](%s) tunnel established: vpn-ip=%s mtu=%d", o.name, prefix, mtu)
 
 	o.startPacketLoops(tunnel)
 	return nil
@@ -262,6 +276,7 @@ func (o *OpenConnect) startPacketLoops(tunnel *oc.Tunnel) {
 			o.runMutex.Lock()
 			if o.tunDevice == tunDevice {
 				o.tunDevice = nil
+				o.tunnel = nil
 				o.running = false
 			}
 			o.runMutex.Unlock()

@@ -1,0 +1,12 @@
+.idea/*
+!.idea/codeStyles
+!.idea/*.iml
+!.idea/modules.xml
+.http/http-client.private.env.json
+.DS_Store
+
+test.go
+test
+vpnagent
+sslcon
+*.exe

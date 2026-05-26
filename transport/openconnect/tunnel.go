@@ -19,10 +19,13 @@ import (
 )
 
 type Tunnel struct {
-	cSess    *session.ConnSession
-	closeOnce sync.Once
-	closeChan chan struct{}
+	cSess         *session.ConnSession
+	closeOnce     sync.Once
+	closeChan     chan struct{}
+	releaseGlobal func()
 }
+
+var activeTunnelMu sync.Mutex
 
 type TunnelConfig struct {
 	Server         string
@@ -38,6 +41,17 @@ type TunnelConfig struct {
 }
 
 func NewTunnel(ctx context.Context, cfg TunnelConfig, dialer func(ctx context.Context, network, addr string) (net.Conn, error)) (*Tunnel, error) {
+	if !activeTunnelMu.TryLock() {
+		return nil, errors.New("openconnect: another tunnel is already active")
+	}
+	releaseGlobal := activeTunnelMu.Unlock
+	locked := true
+	defer func() {
+		if locked {
+			releaseGlobal()
+		}
+	}()
+
 	hostWithPort := net.JoinHostPort(cfg.Server, strconv.Itoa(cfg.Port))
 
 	prof := &lib.Profile{
@@ -109,9 +123,11 @@ func NewTunnel(ctx context.Context, cfg TunnelConfig, dialer func(ctx context.Co
 	}
 	log.Debugln("[OpenConnect] tunnel established: vpn-ip=%s mask=%s mtu=%d dns=%v", cSess.VPNAddress, cSess.VPNMask, cSess.MTU, cSess.DNS)
 
+	locked = false
 	return &Tunnel{
-		cSess:     cSess,
-		closeChan: make(chan struct{}),
+		cSess:         cSess,
+		closeChan:     make(chan struct{}),
+		releaseGlobal: releaseGlobal,
 	}, nil
 }
 
@@ -191,7 +207,14 @@ func (t *Tunnel) DNS() []string {
 
 func (t *Tunnel) Close() error {
 	t.closeOnce.Do(func() {
-		session.Sess.ActiveClose = true
+		defer func() {
+			if t.releaseGlobal != nil {
+				t.releaseGlobal()
+			}
+		}()
+		if session.Sess != nil {
+			session.Sess.ActiveClose = true
+		}
 		if t.cSess != nil {
 			t.cSess.Close()
 		}
