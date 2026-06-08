@@ -413,7 +413,7 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 	}
 
 	// 7. Configure overlay transport (relay)
-	resolvedRelay := resolveRelayEndpoint(regResult.RelayEndpoint, cfg.ServerURL)
+	resolvedRelay := normalizeRelayEndpoint(resolveRelayEndpoint(regResult.RelayEndpoint, cfg.ServerURL))
 	m.logf("[Overlay-Go] Relay endpoint from registration: raw=%q resolved=%q", regResult.RelayEndpoint, resolvedRelay)
 
 	// 7a. Try multi-region relay selection if bootstrap URL is available
@@ -1227,7 +1227,7 @@ func (m *OverlayManager) fetchRelayServers() []relayServerEntry {
 // probeRelayLatency sends a UDP keepalive packet to a relay endpoint and
 // measures the round-trip time. Returns -1 if the probe fails or times out.
 func (m *OverlayManager) probeRelayLatency(endpoint string) int64 {
-	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
+	udpAddr, err := net.ResolveUDPAddr("udp", normalizeRelayEndpoint(endpoint))
 	if err != nil {
 		return -1
 	}
@@ -1283,8 +1283,9 @@ func (m *OverlayManager) selectBestRelay(servers []relayServerEntry, fallbackEnd
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			lat := m.probeRelayLatency(s.URL)
-			results[i] = probeResult{endpoint: s.URL, region: s.Region, latencyMs: lat}
+			ep := normalizeRelayEndpoint(s.URL)
+			lat := m.probeRelayLatency(ep)
+			results[i] = probeResult{endpoint: ep, region: s.Region, latencyMs: lat}
 		}()
 	}
 	wg.Wait()
@@ -1393,7 +1394,6 @@ func (m *OverlayManager) pollRemoteSignaling() {
 	pendingUfrags := make(map[string]string)
 
 	m.mu.Lock()
-	myDeviceID := m.deviceID
 
 	for _, peer := range peers {
 		if len(peer.Candidates) == 0 {
@@ -1437,8 +1437,9 @@ func (m *OverlayManager) pollRemoteSignaling() {
 			}
 		}
 
-		// Process SDPs first
-		isOfferer := myDeviceID < peer.ID
+		// Process SDPs first. Direct P2P is now explicitly initiated by
+		// ForceP2POffer, so the old deterministic "lower device ID offers"
+		// rule is not reliable: either peer may be the offerer.
 		type latestSDPInfo struct {
 			candidate overlayCandidate
 			sigKey    string
@@ -1457,12 +1458,11 @@ func (m *OverlayManager) pollRemoteSignaling() {
 				sdpType = "answer"
 			}
 
-			// Skip SDPs of the wrong type for our role
-			if isOfferer && sdpType == "offer" {
-				m.markSeen(peer.ID, sigKey)
-				continue
-			}
-			if !isOfferer && sdpType == "answer" {
+			weOffered := m.offeredPeers[peer.ID]
+
+			// Answers are only meaningful when this device actually has a
+			// pending local offer. Otherwise they are stale remote signaling.
+			if sdpType == "answer" && !weOffered {
 				m.markSeen(peer.ID, sigKey)
 				continue
 			}
@@ -1500,8 +1500,10 @@ func (m *OverlayManager) pollRemoteSignaling() {
 		if latestSDP != nil {
 			currentState := m.peerStates[peer.ID]
 
+			weOffered := m.offeredPeers[peer.ID]
+
 			// Answerer in failed state receiving a new offer — recover
-			if currentState == peerStateFailed && !isOfferer && latestSDP.sdpType == "offer" {
+			if currentState == peerStateFailed && !weOffered && latestSDP.sdpType == "offer" {
 				m.logf("[Overlay-Go] Received new offer from peer %s, clearing failed state", truncateID(peer.ID))
 				delete(m.peerSessionIDs, peer.ID)
 				delete(m.peerUfrags, peer.ID)
@@ -1512,8 +1514,11 @@ func (m *OverlayManager) pollRemoteSignaling() {
 			shouldInject := false
 			if currentState == peerStateConnected {
 				m.logf("[Overlay-Go] Skipping new %s from %s, already connected", latestSDP.sdpType, truncateID(peer.ID))
-			} else if currentState == peerStateSDPReceived && isOfferer && latestSDP.sdpType == "answer" {
+			} else if currentState == peerStateSDPReceived && weOffered && latestSDP.sdpType == "answer" {
 				shouldInject = true
+			} else if currentState == peerStateSDPReceived && weOffered && latestSDP.sdpType == "offer" {
+				m.logf("[Overlay-Go] Skipping glare offer from %s while waiting for answer", truncateID(peer.ID))
+				m.markSeen(peer.ID, latestSDP.sigKey)
 			} else if currentState == peerStateSDPReceived {
 				m.logf("[Overlay-Go] Skipping new %s from %s, SDP already in progress (%s)",
 					latestSDP.sdpType, truncateID(peer.ID), currentState)
@@ -1753,6 +1758,7 @@ func (m *OverlayManager) scheduleRelayFallback(peerID string) {
 	delete(m.peerSessionIDs, peerID)
 	delete(m.peerUfrags, peerID)
 	delete(m.failedPeers, peerID)
+	delete(m.offeredPeers, peerID)
 	m.peerStates[peerID] = peerStateIdle
 	m.mu.Unlock()
 
@@ -1926,6 +1932,7 @@ func (m *OverlayManager) wireP2PCallbacks() {
 			delete(m.failedPeers, peerID)
 			delete(m.peerFailCount, peerID)
 			delete(m.peerCooldownUntil, peerID)
+			delete(m.offeredPeers, peerID)
 			hasDC := globalOverlayTransport.HasPacketConn(peerID)
 			m.logf("[Overlay-Go] P2P connected for %s — DataChannel registered: %v", truncateID(peerID), hasDC)
 			// DataChannel may open shortly after PeerConnection becomes connected.
@@ -1946,9 +1953,11 @@ func (m *OverlayManager) wireP2PCallbacks() {
 			m.logf("[Overlay-Go] P2P disconnected for %s, resetting state to allow re-negotiation", truncateID(peerID))
 			m.peerStates[peerID] = peerStateFailed
 			m.failedPeers[peerID] = true
+			delete(m.offeredPeers, peerID)
 		case "failed":
 			m.peerStates[peerID] = peerStateFailed
 			m.failedPeers[peerID] = true
+			delete(m.offeredPeers, peerID)
 			m.peerFailCount[peerID]++
 			failCount := m.peerFailCount[peerID]
 			if failCount >= maxP2PFailures {
@@ -1966,6 +1975,7 @@ func (m *OverlayManager) wireP2PCallbacks() {
 			} else {
 				m.peerStates[peerID] = peerStateFailed
 				m.failedPeers[peerID] = true
+				delete(m.offeredPeers, peerID)
 				m.logf("[Overlay-Go] P2P closed for %s, traffic will relay via VPS", truncateID(peerID))
 			}
 		}
@@ -2348,6 +2358,27 @@ func resolveRelayEndpoint(endpoint, serverURL string) string {
 		return serverURL + endpoint
 	}
 	return endpoint
+}
+
+// normalizeRelayEndpoint converts a relay endpoint into the bare "host:port"
+// form expected by net.ResolveUDPAddr. It tolerates values that carry a
+// scheme prefix (e.g. "udp://host:8091", "wss://host:8091") as well as a
+// trailing path/query, both of which would otherwise make ResolveUDPAddr
+// fail. Bare "host:port" (and IPv6 "[::1]:port") values are returned as-is.
+func normalizeRelayEndpoint(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return raw
+	}
+	// Strip an optional "scheme://" prefix.
+	if idx := strings.Index(raw, "://"); idx >= 0 {
+		raw = raw[idx+3:]
+	}
+	// Strip any trailing path or query (e.g. "host:8091/foo?bar").
+	if idx := strings.IndexAny(raw, "/?"); idx >= 0 {
+		raw = raw[:idx]
+	}
+	return strings.TrimSpace(raw)
 }
 
 // truncateID returns a short prefix of a device/peer ID for log messages.
