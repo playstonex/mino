@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"net"
+	"sync"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/common/sockopt"
@@ -17,6 +18,7 @@ var (
 	server  = &Server{}
 
 	dnsDefaultTTL uint32 = 600
+	dnsMu                sync.Mutex
 )
 
 type Server struct {
@@ -31,12 +33,15 @@ func (s *Server) ServeDNS(w D.ResponseWriter, r *D.Msg) {
 	if err != nil {
 		m := new(D.Msg)
 		m.SetRcode(r, D.RcodeServerFailure)
-		// does not matter if this write fails
-		w.WriteMsg(m)
+		if writeErr := w.WriteMsg(m); writeErr != nil {
+			log.Debugln("DNS: failed to write error response: %s", writeErr.Error())
+		}
 		return
 	}
 	msg.Compress = true
-	w.WriteMsg(msg)
+	if writeErr := w.WriteMsg(msg); writeErr != nil {
+		log.Debugln("DNS: failed to write response: %s", writeErr.Error())
+	}
 }
 
 func (s *Server) SetService(service resolver.Service) {
@@ -44,6 +49,9 @@ func (s *Server) SetService(service resolver.Service) {
 }
 
 func ReCreateServer(addr string, service resolver.Service) {
+	dnsMu.Lock()
+	defer dnsMu.Unlock()
+
 	if addr == address && service != nil {
 		server.SetService(service)
 		return

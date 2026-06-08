@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +40,8 @@ var (
 
 	embedMode = false
 )
+
+var serverMu sync.Mutex
 
 func SetEmbedMode(embed bool) {
 	embedMode = embed
@@ -88,6 +91,8 @@ func (c Cors) Apply(r chi.Router) {
 }
 
 func ReCreateServer(cfg *Config) {
+	serverMu.Lock()
+	defer serverMu.Unlock()
 	go start(cfg)
 	go startTLS(cfg)
 	go startUnix(cfg)

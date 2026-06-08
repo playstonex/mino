@@ -55,7 +55,7 @@ var (
 	udpInOnce sync.Once
 
 	// Outbound Rule
-	mode = Rule
+	modeVal = atomic.NewInt32Enum(Rule)
 
 	// default timeout for UDP session
 	udpTimeout = 60 * time.Second
@@ -158,6 +158,8 @@ func SetSniffing(b bool) {
 }
 
 func IsSniffing() bool {
+	configMux.RLock()
+	defer configMux.RUnlock()
 	return sniffingEnable
 }
 
@@ -250,12 +252,12 @@ func UpdateSniffer(dispatcher *sniffer.Dispatcher) {
 
 // Mode return current mode
 func Mode() TunnelMode {
-	return mode
+	return modeVal.Load()
 }
 
 // SetMode change the mode of tunnel
 func SetMode(m TunnelMode) {
-	mode = m
+	modeVal.Store(m)
 }
 
 func FindProcessMode() process.FindProcessMode {
@@ -387,7 +389,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		helper.FindProcess = nil
 	}
 
-	switch mode {
+	switch modeVal.Load() {
 	case Direct:
 		proxy = proxies["DIRECT"]
 	case Global:
@@ -631,9 +633,9 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 		} else {
 			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
 		}
-	case mode == Global:
+	case modeVal.Load() == Global:
 		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
-	case mode == Direct:
+	case modeVal.Load() == Direct:
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
 		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())

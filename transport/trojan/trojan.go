@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -93,25 +94,25 @@ func WritePacket(w io.Writer, socks5Addr, payload []byte) (int, error) {
 func ReadPacket(r io.Reader, payload []byte) (net.Addr, int, int, error) {
 	addr, err := socks5.ReadAddr(r, payload)
 	if err != nil {
-		return nil, 0, 0, errors.New("read addr error")
+		return nil, 0, 0, fmt.Errorf("trojan: read addr: %w", err)
 	}
 	uAddr := addr.UDPAddr()
 	if uAddr == nil {
-		return nil, 0, 0, errors.New("parse addr error")
+		return nil, 0, 0, errors.New("trojan: parse addr error")
 	}
 
 	if _, err = io.ReadFull(r, payload[:2]); err != nil {
-		return nil, 0, 0, errors.New("read length error")
+		return nil, 0, 0, fmt.Errorf("trojan: read length: %w", err)
 	}
 
 	total := int(binary.BigEndian.Uint16(payload[:2]))
 	if total > maxLength {
-		return nil, 0, 0, errors.New("packet invalid")
+		return nil, 0, 0, fmt.Errorf("trojan: packet too large: %d > %d", total, maxLength)
 	}
 
 	// read crlf
 	if _, err = io.ReadFull(r, payload[:2]); err != nil {
-		return nil, 0, 0, errors.New("read crlf error")
+		return nil, 0, 0, fmt.Errorf("trojan: read crlf: %w", err)
 	}
 
 	length := len(payload)
@@ -120,7 +121,7 @@ func ReadPacket(r io.Reader, payload []byte) (net.Addr, int, int, error) {
 	}
 
 	if _, err = io.ReadFull(r, payload[:length]); err != nil {
-		return nil, 0, 0, errors.New("read packet error")
+		return nil, 0, 0, fmt.Errorf("trojan: read packet: %w", err)
 	}
 
 	return uAddr, length, total - length, nil
