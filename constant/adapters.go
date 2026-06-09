@@ -61,7 +61,7 @@ const (
 	DefaultTestURL    = "https://www.gstatic.com/generate_204"
 )
 
-var ErrNotSupport = errors.New("no support")
+var ErrNotSupported = errors.New("no support")
 
 type Connection interface {
 	Chains() Chain

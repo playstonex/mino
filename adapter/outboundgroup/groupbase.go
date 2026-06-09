@@ -267,11 +267,15 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 		return
 	}
 
-	if errors.Is(err, C.ErrNotSupport) {
+	if errors.Is(err, C.ErrNotSupported) {
 		return
 	}
 
 	go func() {
+		if err == nil {
+			return
+		}
+
 		if strings.Contains(err.Error(), "connection refused") {
 			fn()
 			return

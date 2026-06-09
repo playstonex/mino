@@ -197,7 +197,9 @@ func (o *OpenVPN) Close() error {
 	if o.runCancel != nil {
 		o.runCancel()
 	}
-	_ = o.runLock.Acquire(context.Background(), 1)
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer closeCancel()
+	_ = o.runLock.Acquire(closeCtx, 1)
 	client := o.client
 	tunDevice := o.tunDevice
 	o.client = nil

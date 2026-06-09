@@ -15,6 +15,8 @@ import (
 	"time"
 
 	connectip "github.com/metacubex/connect-ip-go"
+
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/http"
 	"github.com/metacubex/quic-go"
 	"github.com/metacubex/quic-go/http3"
@@ -57,7 +59,7 @@ func PrepareTlsConfig(privKey *ecdsa.PrivateKey, peerPubKey *ecdsa.PublicKey, sn
 
 	cert, err := GenerateCert(privKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate cert: %v", err)
+		return nil, fmt.Errorf("failed to generate cert: %w", err)
 	}
 
 	tlsConfig := &tls.Config{
@@ -128,11 +130,13 @@ func ConnectTunnel(ctx context.Context, quicConn *quic.Conn, connectUri string) 
 	template := uritemplate.MustNew(connectUri)
 	ipConn, rsp, err := dialEx(ctx, hconn, template, "cf-connect-ip", additionalHeaders, true)
 	if err != nil {
-		_ = tr.Close()
+		if closeErr := tr.Close(); closeErr != nil {
+			log.Warnln("[Masque] error closing transport after failed dial: %v", closeErr)
+		}
 		if err.Error() == "CRYPTO_ERROR 0x131 (remote): tls: access denied" {
 			return nil, nil, errors.New("login failed! Please double-check if your tls key and cert is enrolled in the Cloudflare Access service")
 		}
-		return nil, nil, fmt.Errorf("failed to dial connect-ip: %v", err)
+		return nil, nil, fmt.Errorf("failed to dial connect-ip: %w", err)
 	}
 
 	err = ipConn.AdvertiseRoute(ctx, []connectip.IPRoute{

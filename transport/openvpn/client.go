@@ -38,6 +38,9 @@ type Client struct {
 	lastReceiveNano atomic.Int64
 }
 
+// NewClient creates a new OpenVPN client. The returned client starts an
+// internal goroutine (mux.Run) that runs until Close is called.
+// Caller MUST call Close to release the goroutine.
 func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	if config == nil {
 		return nil, errors.New("nil openvpn client config")

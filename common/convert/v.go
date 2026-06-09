@@ -112,7 +112,7 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 		if earlyData := query.Get("ed"); earlyData != "" {
 			med, err := strconv.Atoi(earlyData)
 			if err != nil {
-				return fmt.Errorf("bad WebSocket max early data size: %v", err)
+				return fmt.Errorf("bad WebSocket max early data size: %w", err)
 			}
 			switch network {
 			case "ws":

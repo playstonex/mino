@@ -46,7 +46,7 @@ func New(config LC.Hysteria2RealmServer, tunnel C.Tunnel, additions ...inbound.A
 
 	pat, err := regexp.Compile(config.RealmNamePattern)
 	if err != nil {
-		return nil, fmt.Errorf("invalid realm name pattern %q: %v", config.RealmNamePattern, err)
+		return nil, fmt.Errorf("invalid realm name pattern %q: %w", config.RealmNamePattern, err)
 	}
 	s := newServer(serverConfig{
 		realmToken:     config.Token,

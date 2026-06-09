@@ -38,7 +38,7 @@ type option struct {
 	network       int
 	prefer        int
 	tfo           bool
-	mpTcp         bool
+	mptcp         bool
 	resolver      resolver.Resolver
 	netDialer     NetDialer
 }
@@ -103,9 +103,9 @@ func WithTFO(tfo bool) Option {
 	}
 }
 
-func WithMPTCP(mpTcp bool) Option {
+func WithMPTCP(mptcpEnabled bool) Option {
 	return func(opt *option) {
-		opt.mpTcp = mpTcp
+		opt.mptcp = mptcpEnabled
 	}
 }
 
