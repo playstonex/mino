@@ -9,12 +9,17 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/tls"
+	"golang.org/x/sync/semaphore"
 )
 
-const defaultHandshakeTimeout = 30 * time.Second
+const (
+	DefaultHandshakeTimeout = 30 * time.Second
+	ControlRetransmitDelay  = time.Second
+)
 
 type Client struct {
 	config *ClientConfig
@@ -26,8 +31,16 @@ type Client struct {
 	push    *PushReply
 
 	cancel context.CancelFunc
+
+	writeSem *semaphore.Weighted
+
+	lastSendNano    atomic.Int64
+	lastReceiveNano atomic.Int64
 }
 
+// NewClient creates a new OpenVPN client. The returned client starts an
+// internal goroutine (mux.Run) that runs until Close is called.
+// Caller MUST call Close to release the goroutine.
 func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	if config == nil {
 		return nil, errors.New("nil openvpn client config")
@@ -35,9 +48,13 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	if io == nil {
 		return nil, errors.New("nil openvpn packet io")
 	}
-	crypt, err := NewTLSCrypt(config.TLSCryptKey, true)
-	if err != nil {
-		return nil, err
+	var crypt *TLSCrypt
+	if len(config.TLSCryptKey) > 0 {
+		var err error
+		crypt, err = NewTLSCrypt(config.TLSCryptKey, true)
+		if err != nil {
+			return nil, err
+		}
 	}
 	local, err := NewSessionID()
 	if err != nil {
@@ -46,12 +63,16 @@ func NewClient(config *ClientConfig, io PacketIO) (*Client, error) {
 	runCtx, cancel := context.WithCancel(context.Background())
 	mux := NewPacketMux(io)
 	go mux.Run(runCtx)
-	return &Client{
-		config:  config,
-		mux:     mux,
-		control: NewControlChannel(mux, crypt, local),
-		cancel:  cancel,
-	}, nil
+	client := &Client{
+		config:   config,
+		mux:      mux,
+		control:  NewControlChannel(mux, crypt, local),
+		cancel:   cancel,
+		writeSem: semaphore.NewWeighted(1),
+	}
+	client.markSend()
+	client.markReceive()
+	return client, nil
 }
 
 func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
@@ -60,7 +81,7 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 	}
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, defaultHandshakeTimeout)
+		ctx, cancel = context.WithTimeout(ctx, DefaultHandshakeTimeout)
 		defer cancel()
 	}
 	if err := c.control.SendReset(ctx); err != nil {
@@ -84,8 +105,8 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 	}
 
 	clientRecord, err := NewClientKeyMethod2Record(
-		InstallScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth),
-		InstallScriptPeerInfo(c.config.Cipher),
+		InstallScriptOptionsString(c.config.Proto, c.config.Cipher, c.config.Auth, c.config.CompLZO),
+		InstallScriptPeerInfo(c.config.Cipher, c.config.CompLZO),
 		strings.TrimSpace(c.config.Username),
 		c.config.Password,
 	)
@@ -119,22 +140,48 @@ func (c *Client) Handshake(ctx context.Context) (*PushReply, error) {
 		return nil, err
 	}
 	c.push = push
-	c.data, err = NewDataChannel(keys, push.PeerID)
+	c.data, err = NewDataChannel(keys, c.config.Cipher, c.config.Auth, push.PeerID)
 	if err != nil {
 		return nil, err
 	}
+	c.markSend()
+	c.markReceive()
 	return push, nil
 }
 
 func (c *Client) WriteIPPacket(ctx context.Context, packet []byte) error {
+	return c.writeDataPacket(ctx, packet, true)
+}
+
+func (c *Client) WritePing(ctx context.Context) error {
+	return c.writeDataPacket(ctx, openVPNPingPacket, false)
+}
+
+func (c *Client) writeDataPacket(ctx context.Context, packet []byte, compress bool) error {
 	if c.data == nil {
 		return errors.New("openvpn data channel is not ready")
+	}
+	if err := c.writeSem.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer c.writeSem.Release(1)
+	if compress && c.config.CompLZO == CompLzoYes {
+		compressed, err := lzo1xCompressSafe(packet)
+		if err != nil {
+			return err
+		}
+		packet = compressed
 	}
 	encrypted, err := c.data.Encrypt(packet)
 	if err != nil {
 		return err
 	}
-	return c.mux.WritePacket(ctx, encrypted)
+	err = c.mux.WritePacket(ctx, encrypted)
+	if err != nil {
+		return err
+	}
+	c.markSend()
+	return nil
 }
 
 func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
@@ -150,9 +197,37 @@ func (c *Client) ReadIPPacket(ctx context.Context) ([]byte, error) {
 		if err != nil {
 			continue
 		}
+		c.markReceive()
+		if IsPingPacket(plain) {
+			continue
+		}
+		if c.config.CompLZO == CompLzoYes && len(plain) > 0 {
+			return lzo1xDecompressSafe(plain)
+		}
 		return plain, nil
 	}
 }
+
+func (c *Client) SinceSend() time.Duration {
+	return time.Duration(int64(time.Since(start)) - c.lastSendNano.Load())
+}
+
+func (c *Client) SinceReceive() time.Duration {
+	return time.Duration(int64(time.Since(start)) - c.lastReceiveNano.Load())
+}
+
+func (c *Client) markSend() {
+	c.lastSendNano.Store(int64(time.Since(start)))
+}
+
+func (c *Client) markReceive() {
+	c.lastReceiveNano.Store(int64(time.Since(start)))
+}
+
+// The absolute value doesn't matter, but it should be in the past,
+// so that every timestamp obtained with Now() is non-zero,
+// even on systems with low timer resolutions (e.g. Windows).
+var start = time.Now().Add(-time.Hour)
 
 func (c *Client) Close() error {
 	if c.cancel != nil {
@@ -168,10 +243,24 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) waitServerReset(ctx context.Context) error {
+	retransmits := 0
 	for {
-		packet, err := c.control.Read(ctx)
+		readCtx := ctx
+		cancel := func() {}
+		if c.config.Proto == ProtoUDP {
+			readCtx, cancel = context.WithTimeout(ctx, ControlRetransmitDelay)
+		}
+		packet, err := c.control.Read(readCtx)
+		cancel()
 		if err != nil {
-			return fmt.Errorf("read hard reset response: %w", err)
+			if c.config.Proto == ProtoUDP && errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+				if err := c.control.RetransmitPending(ctx); err != nil {
+					return fmt.Errorf("retransmit hard reset: %w", err)
+				}
+				retransmits++
+				continue
+			}
+			return fmt.Errorf("read hard reset response after %d retransmits: %w", retransmits, err)
 		}
 		switch packet.Opcode {
 		case PControlHardResetServerV2:

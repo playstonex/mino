@@ -34,7 +34,7 @@ type Base struct {
 	udp    bool
 	xudp   bool
 	tfo    bool
-	mpTcp  bool
+	mptcp  bool
 	iface  string
 	rmark  int
 	prefer C.DNSPrefer
@@ -65,7 +65,7 @@ func NewBase(opt BaseOption) *Base {
 		udp:    opt.UDP,
 		xudp:   opt.XUDP,
 		tfo:    opt.TFO,
-		mpTcp:  opt.MPTCP,
+		mptcp:  opt.MPTCP,
 		iface:  opt.Interface,
 		rmark:  opt.RoutingMark,
 		prefer: opt.Prefer,
@@ -89,12 +89,12 @@ func (b *Base) Type() C.AdapterType {
 }
 
 func (b *Base) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
-	return nil, C.ErrNotSupport
+	return nil, C.ErrNotSupported
 }
 
 // ListenPacketContext implements C.ProxyAdapter
 func (b *Base) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	return nil, C.ErrNotSupport
+	return nil, C.ErrNotSupported
 }
 
 // SupportUOT implements C.ProxyAdapter
@@ -111,7 +111,7 @@ func (b *Base) SupportUDP() bool {
 func (b *Base) ProxyInfo() (info C.ProxyInfo) {
 	info.XUDP = b.xudp
 	info.TFO = b.tfo
-	info.MPTCP = b.mpTcp
+	info.MPTCP = b.mptcp
 	info.SMUX = false
 	info.Interface = b.iface
 	info.RoutingMark = b.rmark
@@ -168,7 +168,7 @@ func (b *Base) DialOptions() (opts []dialer.Option) {
 		opts = append(opts, dialer.WithTFO(true))
 	}
 
-	if b.mpTcp {
+	if b.mptcp {
 		opts = append(opts, dialer.WithMPTCP(true))
 	}
 
@@ -202,6 +202,7 @@ type BasicOption struct {
 	// The following parameters are used internally, assign value by the structure decoder are disallowed
 	//
 	DialerForAPI C.Dialer `proxy:"-"` // the dialer used for API usage has higher priority than all the above configurations.
+	TunnelForAPI C.Tunnel `proxy:"-"`
 	ProviderName string   `proxy:"-"`
 }
 
@@ -209,12 +210,16 @@ func (b *BasicOption) NewDialer(opts []dialer.Option) C.Dialer {
 	cDialer := b.DialerForAPI
 	if cDialer == nil {
 		if b.DialerProxy != "" {
-			cDialer = proxydialer.NewByName(b.DialerProxy)
+			cDialer = proxydialer.NewByName(b.DialerProxy, b.NewTunnel())
 		} else {
 			cDialer = dialer.NewDialer(opts...)
 		}
 	}
 	return cDialer
+}
+
+func (b *BasicOption) NewTunnel() C.Tunnel {
+	return b.TunnelForAPI
 }
 
 type conn struct {

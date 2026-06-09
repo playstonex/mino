@@ -20,7 +20,7 @@ func ExecCmd(cmdStr string) (string, error) {
 	prepareBackgroundCommand(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("%v, %s", err, string(out))
+		return "", fmt.Errorf("%w, %s", err, string(out))
 	}
 	return string(out), nil
 }
@@ -47,7 +47,7 @@ func ExecShell(shellStr string) (string, error) {
 	prepareBackgroundCommand(cmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("%v, %s", err, string(out))
+		return "", fmt.Errorf("%w, %s", err, string(out))
 	}
 	return string(out), nil
 }

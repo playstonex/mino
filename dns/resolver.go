@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/arc"
@@ -47,6 +48,7 @@ type Resolver struct {
 	cache                 dnsCache
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
+	wg                    sync.WaitGroup
 }
 
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
@@ -155,7 +157,9 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 	continueFetch := false
 	defer func() {
 		if continueFetch || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			r.wg.Add(1)
 			go func() {
+				defer r.wg.Done()
 				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
 				defer cancel()
 				_, _ = r.exchangeWithoutCache(ctx, m) // ignore result, just for putMsgToCache
@@ -231,7 +235,9 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 		case result = <-ch: // maybe ctxDone and chFinish in same time, get DoChan's result as much as possible
 			break
 		default:
+			r.wg.Add(1)
 			go func() { // start a retrying monitor in background
+				defer r.wg.Done()
 				result := <-ch
 				ret, err, shared := result.Val, result.Err, result.Shared
 				if err != nil && !shared && ret.Opcode < retryMax { // retry
@@ -297,26 +303,43 @@ func (r *Resolver) shouldOnlyQueryFallback(m *D.Msg) bool {
 
 func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
 	if matched := r.matchPolicy(m); len(matched) != 0 {
-		res := <-r.asyncExchange(ctx, matched, m)
-		return res.Msg, res.Error
+		select {
+		case res := <-r.asyncExchange(ctx, matched, m):
+			return res.Msg, res.Error
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	onlyFallback := r.shouldOnlyQueryFallback(m)
 
 	if onlyFallback {
-		res := <-r.asyncExchange(ctx, r.fallback, m)
-		return res.Msg, res.Error
+		select {
+		case res := <-r.asyncExchange(ctx, r.fallback, m):
+			return res.Msg, res.Error
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
 	msgCh := r.asyncExchange(ctx, r.main, m)
 
 	if r.fallback == nil || len(r.fallback) == 0 { // directly return if no fallback servers are available
-		res := <-msgCh
-		msg, err = res.Msg, res.Error
-		return
+		select {
+		case res := <-msgCh:
+			msg, err = res.Msg, res.Error
+			return
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 
-	res := <-msgCh
+	var res *result
+	select {
+	case res = <-msgCh:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if res.Error == nil {
 		if ips := msgToIP(res.Msg); len(ips) != 0 {
 			shouldNotFallback := lo.EveryBy(ips, func(ip netip.Addr) bool {
@@ -329,9 +352,13 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 		}
 	}
 
-	res = <-r.asyncExchange(ctx, r.fallback, m)
-	msg, err = res.Msg, res.Error
-	return
+	select {
+	case res = <-r.asyncExchange(ctx, r.fallback, m):
+		msg, err = res.Msg, res.Error
+		return
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (r *Resolver) lookupIP(ctx context.Context, host string, dnsType uint16) (ips []netip.Addr, err error) {
@@ -413,8 +440,17 @@ type NameServer struct {
 
 func (ns NameServer) Equal(ns2 NameServer) bool {
 	defer func() {
-		// C.ProxyAdapter compare maybe panic, just ignore
-		recover()
+		// C.ProxyAdapter compare may panic if one is nil and the other has an uncomparable type
+		// only recover from runtime panics (e.g. comparing incomparable interface values),
+		// not from nil deref or index OOB which indicate real bugs
+		if r := recover(); r != nil {
+			if _, ok := r.(string); ok {
+				// runtime panic from interface comparison ("comparing uncomparable type ...")
+				return
+			}
+			// re-panic for anything else (nil deref, index OOB, etc.)
+			panic(r)
+		}
 	}()
 	if ns.Net == ns2.Net &&
 		ns.Addr == ns2.Addr &&

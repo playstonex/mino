@@ -45,7 +45,7 @@ func NewAllocator() Allocator {
 func (alloc *defaultAllocator) Get(size int) []byte {
 	switch {
 	case size < 0:
-		panic("alloc.Get: len out of range")
+		return nil
 	case size == 0:
 		return nil
 	case size > 65536:

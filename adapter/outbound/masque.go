@@ -78,20 +78,22 @@ type MasqueOption struct {
 func (option MasqueOption) Prefixes() ([]netip.Prefix, error) {
 	localPrefixes := make([]netip.Prefix, 0, 2)
 	if len(option.Ip) > 0 {
-		if !strings.Contains(option.Ip, "/") {
-			option.Ip = option.Ip + "/32"
+		ip := option.Ip
+		if !strings.Contains(ip, "/") {
+			ip = ip + "/32"
 		}
-		if prefix, err := netip.ParsePrefix(option.Ip); err == nil {
+		if prefix, err := netip.ParsePrefix(ip); err == nil {
 			localPrefixes = append(localPrefixes, prefix)
 		} else {
 			return nil, fmt.Errorf("ip address parse error: %w", err)
 		}
 	}
 	if len(option.Ipv6) > 0 {
-		if !strings.Contains(option.Ipv6, "/") {
-			option.Ipv6 = option.Ipv6 + "/128"
+		ipv6 := option.Ipv6
+		if !strings.Contains(ipv6, "/") {
+			ipv6 = ipv6 + "/128"
 		}
-		if prefix, err := netip.ParsePrefix(option.Ipv6); err == nil {
+		if prefix, err := netip.ParsePrefix(ipv6); err == nil {
 			localPrefixes = append(localPrefixes, prefix)
 		} else {
 			return nil, fmt.Errorf("ipv6 address parse error: %w", err)
@@ -124,20 +126,20 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 
 	privKeyB64, err := base64.StdEncoding.DecodeString(option.PrivateKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode private key: %v", err)
+		return nil, fmt.Errorf("failed to decode private key: %w", err)
 	}
 	privKey, err := x509.ParseECPrivateKey(privKeyB64)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse private key: %v", err)
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
 
 	endpointPubKeyB64, err := base64.StdEncoding.DecodeString(option.PublicKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode public key: %v", err)
+		return nil, fmt.Errorf("failed to decode public key: %w", err)
 	}
 	pubKey, err := x509.ParsePKIXPublicKey(endpointPubKeyB64)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse public key: %v", err)
+		return nil, fmt.Errorf("failed to parse public key: %w", err)
 	}
 	ecPubKey, ok := pubKey.(*ecdsa.PublicKey)
 	if !ok {
@@ -157,7 +159,7 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 
 	tlsConfig, err := masque.PrepareTlsConfig(privKey, ecPubKey, sni, option.SkipCertVerify)
 	if err != nil {
-		return nil, fmt.Errorf("failed to prepare TLS config: %v\n", err)
+		return nil, fmt.Errorf("failed to prepare TLS config: %w", err)
 	}
 	outbound.tlsConfig = tlsConfig
 
@@ -314,7 +316,7 @@ func (w *Masque) run(ctx context.Context) error {
 			}
 			icmp, err := ipConn.WritePacket(buf[:sizes[0]])
 			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
+				if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
 					log.Errorln("[Masque](%s) connection closed while writing to IP connection: %v", w.name, err)
 					return
 				}
@@ -335,7 +337,7 @@ func (w *Masque) run(ctx context.Context) error {
 		for runCtx.Err() == nil {
 			buf, err := ipConn.ReadPacket()
 			if err != nil {
-				if errors.Is(err, net.ErrClosed) {
+				if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
 					log.Errorln("[Masque](%s) connection closed while writing to IP connection: %v", w.name, err)
 					return
 				}

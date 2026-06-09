@@ -34,7 +34,7 @@ const (
 	DefaultRealmNamePattern = defaultRealmNamePattern
 )
 
-func DefaultALPN() []string { return []string{"h2", "http1.1"} }
+func DefaultALPN() []string { return []string{"h2", "http/1.1"} }
 
 func New(config LC.Hysteria2RealmServer, tunnel C.Tunnel, additions ...inbound.Addition) (*Listener, error) {
 	if len(additions) == 0 {
@@ -46,7 +46,7 @@ func New(config LC.Hysteria2RealmServer, tunnel C.Tunnel, additions ...inbound.A
 
 	pat, err := regexp.Compile(config.RealmNamePattern)
 	if err != nil {
-		return nil, fmt.Errorf("invalid realm name pattern %q: %v", config.RealmNamePattern, err)
+		return nil, fmt.Errorf("invalid realm name pattern %q: %w", config.RealmNamePattern, err)
 	}
 	s := newServer(serverConfig{
 		realmToken:     config.Token,

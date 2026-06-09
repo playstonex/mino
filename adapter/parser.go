@@ -18,6 +18,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 	opt := applyProxyOptions(options...)
 	basicOption := outbound.BasicOption{
 		DialerForAPI: opt.DialerForAPI,
+		TunnelForAPI: opt.TunnelForAPI,
 		ProviderName: opt.ProviderName,
 	}
 
@@ -110,6 +111,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewTuic(*tuicOption)
+	case "gost-relay":
+		relayOption := &outbound.GostRelayOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, relayOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewGostRelay(*relayOption)
 	case "direct":
 		directOption := &outbound.DirectOption{BasicOption: basicOption}
 		err = decoder.Decode(mapping, directOption)
@@ -187,20 +195,6 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewTailscale(*tailscaleOption)
-	case "openconnect":
-		openconnectOption := &outbound.OpenConnectOption{BasicOption: basicOption}
-		err = decoder.Decode(mapping, openconnectOption)
-		if err != nil {
-			break
-		}
-		proxy, err = outbound.NewOpenConnect(*openconnectOption)
-	case "p2p":
-		p2pOption := &outbound.P2POption{BasicOption: basicOption}
-		err = decoder.Decode(mapping, p2pOption)
-		if err != nil {
-			break
-		}
-		proxy, err = outbound.NewP2P(*p2pOption)
 	default:
 		return nil, fmt.Errorf("unsupport proxy type: %s", proxyType)
 	}
@@ -229,6 +223,7 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 
 type proxyOption struct {
 	DialerForAPI C.Dialer
+	TunnelForAPI C.Tunnel
 	ProviderName string
 }
 
@@ -245,6 +240,12 @@ type ProxyOption func(opt *proxyOption)
 func WithDialerForAPI(dialer C.Dialer) ProxyOption {
 	return func(opt *proxyOption) {
 		opt.DialerForAPI = dialer
+	}
+}
+
+func WithTunnelForAPI(tunnel C.Tunnel) ProxyOption {
+	return func(opt *proxyOption) {
+		opt.TunnelForAPI = tunnel
 	}
 }
 

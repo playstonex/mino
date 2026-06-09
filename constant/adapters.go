@@ -21,6 +21,7 @@ const (
 	RejectDrop
 	Compatible
 	Pass
+	PassRule
 	Dns
 
 	Relay
@@ -49,8 +50,7 @@ const (
 	TrustTunnel
 	OpenVPN
 	Tailscale
-	OpenConnect
-	P2P
+	GostRelay
 )
 
 const (
@@ -61,7 +61,7 @@ const (
 	DefaultTestURL    = "https://www.gstatic.com/generate_204"
 )
 
-var ErrNotSupport = errors.New("no support")
+var ErrNotSupported = errors.New("no support")
 
 type Connection interface {
 	Chains() Chain
@@ -184,6 +184,8 @@ func (at AdapterType) String() string {
 		return "Compatible"
 	case Pass:
 		return "Pass"
+	case PassRule:
+		return "PassRule"
 	case Dns:
 		return "Dns"
 	case Shadowsocks:
@@ -226,10 +228,8 @@ func (at AdapterType) String() string {
 		return "OpenVPN"
 	case Tailscale:
 		return "Tailscale"
-	case OpenConnect:
-		return "OpenConnect"
-	case P2P:
-		return "P2P"
+	case GostRelay:
+		return "GostRelay"
 	case Relay:
 		return "Relay"
 	case Selector:

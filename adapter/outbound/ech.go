@@ -24,7 +24,7 @@ func (o ECHOptions) Parse() (*ech.Config, error) {
 	if o.Config != "" {
 		list, err := base64.StdEncoding.DecodeString(o.Config)
 		if err != nil {
-			return nil, fmt.Errorf("base64 decode ech config string failed: %v", err)
+			return nil, fmt.Errorf("base64 decode ech config string failed: %w", err)
 		}
 		echConfig.GetEncryptedClientHelloConfigList = func(ctx context.Context, serverName string) ([]byte, error) {
 			return list, nil
