@@ -45,7 +45,7 @@ var (
 
 // StreamConn is used when the proxy wraps another connection.
 func (p *P2P) StreamConn(c net.Conn, metadata *C.Metadata) (net.Conn, error) {
-	return nil, C.ErrNotSupport
+	return nil, C.ErrNotSupported
 }
 
 func (p *P2P) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
@@ -245,7 +245,7 @@ func NewP2P(option P2POption) (*P2P, error) {
 			pdName: option.ProviderName,
 			udp:    true,
 			tfo:    option.TFO,
-			mpTcp:  option.MPTCP,
+			mptcp:  option.MPTCP,
 			iface:  option.Interface,
 			rmark:  option.RoutingMark,
 			prefer: option.IPVersion,
