@@ -28,6 +28,12 @@ type Manager struct {
 	// PacketConns for UDP-style communication (net.PacketConn)
 	PacketConns map[string]net.PacketConn
 
+	// selectedPairType records the in-use ICE candidate-pair classification per
+	// peer: "direct" (host/srflx/prflx) or "relay" (TURN). Absent = unknown.
+	// Used so callers can report transport honestly instead of treating any
+	// open DataChannel as "direct".
+	selectedPairType map[string]string
+
 	// ICE servers for WebRTC connections
 	iceServers []webrtc.ICEServer
 
@@ -52,9 +58,10 @@ type packetMsg struct {
 func GetManager() *Manager {
 	once.Do(func() {
 		manager = &Manager{
-			Peers:       make(map[string]*webrtc.PeerConnection),
-			Conns:       make(map[string]net.Conn),
-			PacketConns: make(map[string]net.PacketConn),
+			Peers:            make(map[string]*webrtc.PeerConnection),
+			Conns:            make(map[string]net.Conn),
+			PacketConns:      make(map[string]net.PacketConn),
+			selectedPairType: make(map[string]string),
 		}
 	})
 	return manager
@@ -213,6 +220,13 @@ func (m *Manager) NewPeerWithPolicy(peerID string, policy webrtc.ICETransportPol
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
 		stateStr := s.String()
 		m.logf("[P2P] peer %s: connection state: %s", peerID, stateStr)
+		if s == webrtc.PeerConnectionStateConnected {
+			// Report the selected candidate pair so we can tell a genuine
+			// direct path (host/srflx/prflx) from a TURN-relayed one. A relay
+			// pair has the same latency as the VPS relay, so "connected" alone
+			// does not mean the user gets a latency benefit.
+			m.logSelectedCandidatePair(peerID, pc)
+		}
 		if m.OnConnectionStateChange != nil {
 			m.OnConnectionStateChange(peerID, stateStr)
 		}
@@ -227,16 +241,85 @@ func (m *Manager) NewPeerWithPolicy(peerID string, policy webrtc.ICETransportPol
 		}
 	})
 
-	// Note: pc.ICETransport() and pc.SCTPTransport() are private in pion v4,
-	// so we can't log the selected candidate pair without internal access.
-	// The connection state and gathering state logs above provide enough
-	// diagnostic info.
+	// The selected candidate pair (host/srflx/relay) is reported on connect via
+	// logSelectedCandidatePair() using pc.GetStats(); pion v4 does not expose
+	// pc.ICETransport()/SCTPTransport() directly on this version.
 
 	m.Mu.Lock()
 	m.Peers[peerID] = pc
 	m.Mu.Unlock()
 
 	return pc, nil
+}
+
+// logSelectedCandidatePair inspects pc.GetStats() to find the in-use ICE
+// candidate pair, records its classification ("direct" vs "relay") for the
+// peer, and logs the local/remote candidate types. This is the only reliable
+// way to know whether a "connected" P2P session is a genuine direct path or a
+// TURN-relayed one — the latter has no latency advantage over the VPS relay.
+func (m *Manager) logSelectedCandidatePair(peerID string, pc *webrtc.PeerConnection) {
+	report := pc.GetStats()
+
+	candTypes := make(map[string]string) // candidate stats ID -> type
+	for _, s := range report {
+		if cs, ok := s.(webrtc.ICECandidateStats); ok {
+			candTypes[cs.ID] = cs.CandidateType.String()
+		}
+	}
+
+	// Choose the in-use pair: prefer a nominated pair, else any succeeded one.
+	var chosen *webrtc.ICECandidatePairStats
+	var succeeded webrtc.ICECandidatePairStats
+	haveSucceeded := false
+	for _, s := range report {
+		pair, ok := s.(webrtc.ICECandidatePairStats)
+		if !ok {
+			continue
+		}
+		if pair.Nominated {
+			p := pair
+			chosen = &p
+			break
+		}
+		if pair.State == webrtc.StatsICECandidatePairStateSucceeded && !haveSucceeded {
+			succeeded = pair
+			haveSucceeded = true
+		}
+	}
+	if chosen == nil && haveSucceeded {
+		chosen = &succeeded
+	}
+
+	if chosen == nil {
+		m.logf("[P2P] peer %s: connected but no succeeded/nominated candidate pair found in stats", peerID)
+		return
+	}
+
+	localType := candTypes[chosen.LocalCandidateID]
+	remoteType := candTypes[chosen.RemoteCandidateID]
+	isRelay := localType == "relay" || remoteType == "relay"
+	kind := "direct"
+	note := "DIRECT"
+	if isRelay {
+		kind = "relay"
+		note = "TURN-RELAYED (no latency benefit vs VPS relay)"
+	}
+
+	m.Mu.Lock()
+	m.selectedPairType[peerID] = kind
+	m.Mu.Unlock()
+
+	m.logf("[P2P] peer %s: selected candidate pair local=%s remote=%s nominated=%v => %s",
+		peerID, localType, remoteType, chosen.Nominated, note)
+}
+
+// SelectedPathType returns the classification of the in-use ICE candidate pair
+// for a peer: "direct", "relay", or "" if unknown. Callers should treat "relay"
+// (TURN) as having no latency benefit over the VPS relay.
+func (m *Manager) SelectedPathType(peerID string) string {
+	m.Mu.RLock()
+	defer m.Mu.RUnlock()
+	return m.selectedPairType[peerID]
 }
 
 func (m *Manager) AddPeer(peerID string, pc *webrtc.PeerConnection) {
@@ -266,6 +349,7 @@ func (m *Manager) RemovePeer(peerID string) {
 		pc.Close()
 		delete(m.PacketConns, peerID)
 	}
+	delete(m.selectedPairType, peerID)
 }
 
 // Reset closes all peer connections and clears all state.
@@ -286,6 +370,7 @@ func (m *Manager) Reset() {
 		pc.Close()
 		delete(m.PacketConns, id)
 	}
+	m.selectedPairType = make(map[string]string)
 	m.OnLocalDescription = nil
 	m.OnLocalCandidate = nil
 	m.OnConnectionStateChange = nil
@@ -309,6 +394,7 @@ func (m *Manager) closePeerIfCurrent(peerID string, pc *webrtc.PeerConnection) {
 			pconn.Close()
 			delete(m.PacketConns, peerID)
 		}
+		delete(m.selectedPairType, peerID)
 	}
 }
 

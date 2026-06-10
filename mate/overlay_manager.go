@@ -610,11 +610,16 @@ func (m *OverlayManager) SnapshotJSON() string {
 		if v, ok := m.peerLastPingMs[p.ID]; ok {
 			pingMs = v
 		}
-		// Determine actual transport path. Relay is the default; a peer only
-		// becomes direct after the P2P packet DataChannel is actually usable.
+		// Determine actual transport path. Relay is the default; a peer is only
+		// reported "direct" when the P2P DataChannel is open AND the in-use ICE
+		// candidate pair is genuinely direct (host/srflx/prflx). A DataChannel
+		// negotiated over a TURN relay pair has the SAME latency as the VPS
+		// relay, so reporting it as "direct" is misleading (see selected-pair
+		// logging in transport/p2p/manager.go).
 		hasDirectConn := globalOverlayTransport.HasPacketConn(p.ID)
+		pathType := p2p.GetManager().SelectedPathType(p.ID) // "direct" | "relay" | ""
 		actualTransport := "relay"
-		if hasDirectConn && state == peerStateConnected {
+		if hasDirectConn && state == peerStateConnected && pathType != "relay" {
 			actualTransport = "direct"
 		} else if state == peerStateSDPReceived {
 			actualTransport = "connecting"
@@ -944,7 +949,14 @@ func waitForTunReadable(fd int, timeoutMs int) (bool, error) {
 
 // writeToTUN writes a raw IP packet to the TUN file descriptor.
 // On macOS/iOS utun devices, a 4-byte protocol family header must be
-// prepended (AF_INET=2 for IPv4, AF_INET6=30 for IPv6) in host byte order.
+// prepended (AF_INET=2 for IPv4, AF_INET6=30 for IPv6) in NETWORK byte order
+// (big-endian, i.e. the AF value in the last byte: 00 00 00 02).
+//
+// NOTE: this MUST be big-endian. The kernel parses the family with ntohl(), so
+// writing it in native (little-endian) byte order on Apple CPUs produces
+// 02 00 00 00, which the kernel reads as family 0x02000000 (not AF_INET) and
+// silently drops the packet. This matches the WireGuard utun reference
+// (tun_darwin.go: buff[3] = AF_INET) and the sing-tun darwin writer.
 func (m *OverlayManager) writeToTUN(packet []byte) error {
 	if len(packet) < 1 {
 		return nil
@@ -955,9 +967,9 @@ func (m *OverlayManager) writeToTUN(packet []byte) error {
 
 	version := (packet[0] >> 4) & 0x0F
 	if version == 6 {
-		binary.NativeEndian.PutUint32(buf[:4], 30) // AF_INET6
+		binary.BigEndian.PutUint32(buf[:4], 30) // AF_INET6
 	} else {
-		binary.NativeEndian.PutUint32(buf[:4], 2) // AF_INET
+		binary.BigEndian.PutUint32(buf[:4], 2) // AF_INET
 	}
 	copy(buf[4:], packet)
 	_, err := syscall.Write(m.tunFd, buf[:4+len(packet)])
@@ -1735,22 +1747,21 @@ func (m *OverlayManager) scheduleRelayFallback(peerID string) {
 		return
 	}
 
-	m.mu.RLock()
-	state := m.peerStates[peerID]
-	m.mu.RUnlock()
-
-	// If already connected, no fallback needed
-	if state == peerStateConnected {
-		return
-	}
-
-	// Check if DataChannel is already open (connection may have succeeded
-	// but state tracking lagged)
+	// The ONLY reliable signal that direct P2P is usable is an OPEN packet
+	// DataChannel. PeerConnectionState "connected" (ICE+DTLS up) is NOT
+	// sufficient: SCTP/DataChannel can still fail to open, which leaves the
+	// peer marked peerStateConnected while ALL traffic silently rides the
+	// relay (observed: "SCTP may have failed" + pings stuck at ~500ms).
+	// Gate purely on HasPacketConn so that the half-open case still retries.
 	if globalOverlayTransport.HasPacketConn(peerID) {
 		return
 	}
 
-	m.logf("[Overlay-Go] P2P direct attempt timed out for %s (state=%s), retrying with TURN relay-only",
+	m.mu.RLock()
+	state := m.peerStates[peerID]
+	m.mu.RUnlock()
+
+	m.logf("[Overlay-Go] P2P direct attempt timed out for %s (state=%s, no DataChannel), retrying with TURN relay-only",
 		truncateID(peerID), state)
 
 	// Reset state for retry
@@ -1892,6 +1903,18 @@ func (m *OverlayManager) wireP2PCallbacks() {
 	mgr := p2p.GetManager()
 
 	mgr.Mu.Lock()
+	// Surface the p2p manager's detailed [P2P] diagnostics (ICE candidate
+	// gathering, local/remote candidate types, connection-state changes) into
+	// the tunnel log. Without this, the only visible signal is the
+	// overlay-level state, which hides WHY a direct path fails (e.g. which
+	// candidate pair was selected, host vs srflx vs TURN relay).
+	mgr.Logger = func(format string, args ...any) {
+		if len(args) == 0 {
+			m.logf("%s", format)
+		} else {
+			m.logf(format, args...)
+		}
+	}
 	mgr.OnLocalDescription = func(peerID string, sdp string, sdpType string) {
 		m.logf("[Overlay-Go] Publishing local sdp (%s) for peer %s, payload len=%d",
 			sdpType, truncateID(peerID), len(sdp))
