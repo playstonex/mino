@@ -48,10 +48,9 @@ func (s *Server) SetService(service resolver.Service) {
 	s.service = service
 }
 
-func ReCreateServer(addr string, service resolver.Service) {
+func ReCreateServer(addr string, lc *inbound.ListenerConfig, service resolver.Service) {
 	dnsMu.Lock()
 	defer dnsMu.Unlock()
-
 	if addr == address && service != nil {
 		server.SetService(service)
 		return
@@ -70,7 +69,7 @@ func ReCreateServer(addr string, service resolver.Service) {
 	server.service = nil
 	address = ""
 
-	if addr == "" || service == nil {
+	if addr == "" || lc == nil || service == nil {
 		return
 	}
 
@@ -89,8 +88,6 @@ func ReCreateServer(addr string, service resolver.Service) {
 	address = addr
 	server = &Server{service: service}
 
-	lc := inbound.NewListenerConfig()
-	lc.SetRouteMark(0) // TODO: add route mark support for dns server
 	go func() {
 		p, err := lc.ListenPacket(context.Background(), "udp", addr)
 		if err != nil {
