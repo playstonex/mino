@@ -12,7 +12,7 @@ OUTPUT_DIR="./build/android"
 TEMP_DIR="./build/android/.temp"
 WORK_TMP_DIR=""
 GOMOBILE_CACHE_DIR="./build/gomobile"
-BUILD_TAGS="with_gvisor"
+BUILD_TAGS="with_gvisor,cmfa"
 BUILD_TYPE="${1:-all}"
 
 # Android SDK path (auto-detect or set manually)

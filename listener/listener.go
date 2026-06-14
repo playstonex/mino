@@ -720,6 +720,7 @@ func closeTunListener() {
 		tunLister.Close()
 		tunLister = nil
 	}
+	LastTunConf = LC.Tun{}
 }
 
 func Cleanup() {

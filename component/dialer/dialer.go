@@ -84,6 +84,9 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
 		addrReuseToListenConfig(lc)
 	}
 	if DefaultSocketHook != nil { // ignore interfaceName, routingMark when DefaultSocketHook not null (in CMFA)
+		fmt.Fprintf(os.Stderr, "[dialer] ListenPacket: hooking %s %s (hook is set)\n", network, address)
+
+		// Try the normal path first (socket() + DefaultSocketHook for protect).
 		socketHookToListenConfig(lc)
 	} else {
 		if opt.interfaceName == "" {
@@ -117,7 +120,21 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
 		}
 	}
 
-	return lc.ListenPacket(ctx, network, address)
+	conn, err := lc.ListenPacket(ctx, network, address)
+	if err != nil && DefaultSocketHook != nil {
+		// Fallback: if socket() was blocked (Android 16 seccomp), try
+		// a pre-protected socket from the Kotlin SocketPool.
+		if isSocketBlocked(err) {
+			fmt.Fprintf(os.Stderr, "[dialer] ListenPacket: socket blocked, trying protected pool\n")
+			pConn, pErr := listenPacketWithProtectedSocket(ctx, network, address)
+			if pErr == nil {
+				fmt.Fprintf(os.Stderr, "[dialer] ListenPacket RESULT (protected fallback): %s %s -> OK\n", network, address)
+				return pConn, nil
+			}
+			fmt.Fprintf(os.Stderr, "[dialer] ListenPacket: protected fallback also failed: %v\n", pErr)
+		}
+	}
+	return conn, err
 }
 
 func dialContext(ctx context.Context, network string, destination netip.Addr, port string, opt option) (net.Conn, error) {
@@ -133,6 +150,7 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
 		_netDialer := *netDialer.(*net.Dialer)
 		netDialer = &_netDialer // make a copy
 	default:
+		fmt.Fprintf(os.Stderr, "[dialer] dialContext: non-standard netDialer for %s %s\n", network, address)
 		return netDialer.DialContext(ctx, network, address)
 	}
 
@@ -141,6 +159,11 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
 	mptcp.SetNetDialer(dialer, opt.mptcp)
 
 	if DefaultSocketHook != nil { // ignore interfaceName, routingMark and tfo when DefaultSocketHook not null (in CMFA)
+		fmt.Fprintf(os.Stderr, "[dialer] dialContext: hooking %s %s (hook is set)\n", network, address)
+
+		// Try the normal path first (socket() + DefaultSocketHook for protect).
+		// On Android <16 or when seccomp doesn't block socket(), this works
+		// and avoids wasting SocketPool fds.
 		socketHookToToDialer(dialer)
 	} else {
 		if opt.interfaceName == "" {
@@ -171,7 +194,27 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
 		}
 	}
 
-	return dialer.DialContext(ctx, network, address)
+	conn, dialErr := dialer.DialContext(ctx, network, address)
+	if dialErr != nil {
+		fmt.Fprintf(os.Stderr, "[dialer] dialContext RESULT: %s %s -> error: %v\n", network, address, dialErr)
+
+		// Fallback: if socket() was blocked (Android 16 seccomp), try
+		// a pre-protected socket from the Kotlin SocketPool.
+		if DefaultSocketHook != nil && strings.Contains(network, "tcp") {
+			if isSocketBlocked(dialErr) {
+				fmt.Fprintf(os.Stderr, "[dialer] dialContext: socket blocked, trying protected pool\n")
+				pConn, pErr := dialWithProtectedSocket(ctx, network, address)
+				if pErr == nil {
+					fmt.Fprintf(os.Stderr, "[dialer] dialContext RESULT (protected fallback): %s %s -> OK\n", network, address)
+					return pConn, nil
+				}
+				fmt.Fprintf(os.Stderr, "[dialer] dialContext: protected fallback also failed: %v\n", pErr)
+			}
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "[dialer] dialContext RESULT: %s %s -> OK\n", network, address)
+	}
+	return conn, dialErr
 }
 
 func ICMPControl(destination netip.Addr) func(network, address string, conn syscall.RawConn) error {

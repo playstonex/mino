@@ -2,6 +2,8 @@ package mate
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"runtime"
 	runtimeDebug "runtime/debug"
 
@@ -69,7 +71,9 @@ func NewService(configPath string, platformInterface PlatformInterface) (*Mihomo
 }
 
 func (s *MihomoService) Start() error {
+	fmt.Fprintf(os.Stderr, "[mate] MihomoService.Start: applying config...\n")
 	hub.ApplyConfig(s.Config)
+	fmt.Fprintf(os.Stderr, "[mate] MihomoService.Start: config applied OK\n")
 	return nil
 }
 

@@ -3,12 +3,17 @@ package mate
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
-	// "github.com/metacubex/mihomo/config"
-	// "github.com/metacubex/mihomo/service"
 
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/dns"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/p2p"
 	"github.com/metacubex/mihomo/tunnel/statistic"
 )
@@ -22,6 +27,7 @@ func Say(name string) string {
 
 var globalService *MihomoService
 var globalOverlayManager = NewOverlayManager()
+var globalPlatformInterface PlatformInterface
 
 type ServerConfig struct {
 	ConfigPath string
@@ -33,6 +39,9 @@ type ServerConfig struct {
 
 func Start(config *ServerConfig, platformInterface PlatformInterface) error {
 	var err error
+	fmt.Fprintf(os.Stderr, "[mate] Start: configPath=%s homeDir=%s\n", config.ConfigPath, config.HomeDir)
+
+	globalPlatformInterface = platformInterface
 
 	configPath := config.ConfigPath
 	if configPath == "" {
@@ -48,6 +57,10 @@ func Start(config *ServerConfig, platformInterface PlatformInterface) error {
 
 	if config.LogDir != "" {
 		SetLogDir(config.LogDir)
+		logFile, err := os.Create(filepath.Join(config.LogDir, "out.log"))
+		if err == nil {
+			log.SetLogOutputFile(logFile)
+		}
 	}
 
 	globalService, err = NewService(configPath, platformInterface)
@@ -68,15 +81,55 @@ func Start(config *ServerConfig, platformInterface PlatformInterface) error {
 
 	C.SetTunPacketInterceptor(globalOverlayManager)
 	SetTunCreator(globalService.plantformWrapper)
+
+	dialer.DefaultSocketHook = func(network, address string, conn syscall.RawConn) error {
+		fmt.Fprintf(os.Stderr, "[mate] socketHook: network=%s address=%s\n", network, address)
+		var sockErr error
+		err := conn.Control(func(fd uintptr) {
+			fmt.Fprintf(os.Stderr, "[mate] socketHook.Control callback: fd=%d\n", fd)
+			protected := platformInterface.SocketProtect(int32(fd))
+			fmt.Fprintf(os.Stderr, "[mate] socketHook.Control: SocketProtect(%d) returned %v\n", fd, protected)
+			if !protected {
+				sockErr = fmt.Errorf("socket protect failed for fd %d", fd)
+			}
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[mate] socketHook: conn.Control error: %v\n", err)
+			return err
+		}
+		if sockErr != nil {
+			fmt.Fprintf(os.Stderr, "[mate] socketHook: sockErr: %v\n", sockErr)
+		}
+		return sockErr
+	}
+
+	// Wire up the protected socket pool for bypassing Android 16's
+	// kernel restriction on socket(AF_INET/AF_INET6) after establish().
+	dialer.GetPlatformProtectedSocket = func() int32 {
+		fd := platformInterface.AcquireProtectedSocket()
+		fmt.Fprintf(os.Stderr, "[mate] GetPlatformProtectedSocket: fd=%d\n", fd)
+		return fd
+	}
+
+	fmt.Fprintf(os.Stderr, "[mate] Start: socketHook set, calling globalService.Start()\n")
 	return globalService.Start()
 }
 func Close() error {
 	C.SetTunPacketInterceptor(nil)
 	globalOverlayTransport.Reset()
+	dialer.DefaultSocketHook = nil
+	dialer.GetPlatformProtectedSocket = nil
+	globalPlatformInterface = nil
 	if globalService != nil {
 		return globalService.Close()
 	}
 	return nil
+}
+
+func UpdateSystemDNS(addr string) {
+	dns.UpdateSystemDNS([]string{addr})
+	resolver.ClearCache()
+	resolver.ResetConnection()
 }
 
 type MonitorConnection struct {

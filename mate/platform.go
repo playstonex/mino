@@ -22,6 +22,13 @@ type PlatformInterface interface {
 	ClearDNSCache()
 	SendNotification(notification *Notification) error
 
+	SocketProtect(fd int32) bool
+
+	// AcquireProtectedSocket returns a pre-created, pre-protected socket fd.
+	// Returns -1 if no sockets are available. Used to bypass Android 16's
+	// kernel restriction that blocks socket(AF_INET/AF_INET6) after establish().
+	AcquireProtectedSocket() int32
+
 	// Overlay state change callback (replaces individual P2P callbacks).
 	// The overlay manager handles all P2P signaling internally and sends
 	// consolidated state updates via this single callback for UI display.
