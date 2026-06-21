@@ -324,7 +324,7 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 
 	msgCh := r.asyncExchange(ctx, r.main, m)
 
-	if r.fallback == nil || len(r.fallback) == 0 { // directly return if no fallback servers are available
+	if r.fallback == nil { // directly return if no fallback servers are available
 		select {
 		case res := <-msgCh:
 			msg, err = res.Msg, res.Error
@@ -334,6 +334,7 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 		}
 	}
 
+	fallbackMsg := r.asyncExchange(ctx, r.fallback, m)
 	var res *result
 	select {
 	case res = <-msgCh:
@@ -353,7 +354,7 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 	}
 
 	select {
-	case res = <-r.asyncExchange(ctx, r.fallback, m):
+	case res = <-fallbackMsg:
 		msg, err = res.Msg, res.Error
 		return
 	case <-ctx.Done():
