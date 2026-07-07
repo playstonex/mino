@@ -1,15 +1,10 @@
 package inbound_test
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
-	"os"
-	"os/exec"
-	"strconv"
 	"testing"
-	"time"
 
 	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/listener/inbound"
@@ -18,11 +13,9 @@ import (
 )
 
 func TestInboundVMess_MKCP_V2RayInterop(t *testing.T) {
-	if skip, _ := strconv.ParseBool(os.Getenv("SKIP_INTEROP_TEST")); skip {
-		t.Skip("SKIP_INTEROP_TEST is set")
-	}
+	vmessInteropSkip(t)
 
-	v2rayBin := tlsMirrorInteropV2RayBinary(t)
+	v2rayBin := vmessInteropV2RayBinary(t)
 	mkcpInteropTestCase(t, v2rayBin, "default", "", "")
 	mkcpInteropTestCase(t, v2rayBin, "seed", "mihomo-mkcp-interop", "")
 	mkcpInteropTestCase(t, v2rayBin, "header srtp", "", "srtp")
@@ -30,11 +23,11 @@ func TestInboundVMess_MKCP_V2RayInterop(t *testing.T) {
 
 func mkcpInteropTestCase(t *testing.T, v2rayBin, name, seed, header string) {
 	t.Run(name+"/mihomo client to v2ray server", func(t *testing.T) {
-		echoAddr := startTLSMirrorInteropEcho(t)
-		v2rayPort := mkcpInteropReserveUDPPort(t)
+		echoAddr := startVMessInteropEcho(t)
+		v2rayPort := vmessInteropReserveUDPPort(t)
 		config := mkcpInteropServerConfig(t, v2rayPort.Port(), userUUID, seed, header)
 
-		startMKCPInteropV2Ray(t, v2rayBin, config, v2rayPort.Release)
+		startVMessInteropV2Ray(t, v2rayBin, config, v2rayPort.Release, "")
 
 		out, err := outbound.NewVmess(outbound.VmessOption{
 			Name:     "vmess_mkcp_v2ray_server",
@@ -48,14 +41,14 @@ func mkcpInteropTestCase(t *testing.T, v2rayBin, name, seed, header string) {
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = out.Close() })
 
-		tlsMirrorInteropRoundTripWithRetry(t, func() (net.Conn, error) {
-			return out.DialContext(context.Background(), tlsMirrorInteropMetadata(t, echoAddr))
+		vmessInteropRoundTripWithRetry(t, func() (net.Conn, error) {
+			return out.DialContext(context.Background(), vmessInteropMetadata(t, echoAddr))
 		}, 128*1024)
 	})
 
 	t.Run(name+"/v2ray client to mihomo server", func(t *testing.T) {
-		echoAddr := startTLSMirrorInteropEcho(t)
-		v2rayPort := tlsMirrorInteropReservePort(t)
+		echoAddr := startVMessInteropEcho(t)
+		v2rayPort := vmessInteropReserveTCPPort(t)
 
 		in, err := inbound.NewVmess(&inbound.VmessOption{
 			BaseOption: inbound.BaseOption{
@@ -74,15 +67,15 @@ func mkcpInteropTestCase(t *testing.T, v2rayBin, name, seed, header string) {
 		})
 		require.NoError(t, err)
 
-		tunnel := tlsMirrorInteropDirectTunnel(t)
+		tunnel := vmessInteropDirectTunnel(t)
 		require.NoError(t, in.Listen(tunnel))
 		t.Cleanup(func() { _ = in.Close() })
-		inboundPort := tlsMirrorInteropParsePort(t, tlsMirrorInteropPort(in.Address()))
+		inboundPort := vmessInteropParsePort(t, vmessInteropPort(in.Address()))
 
-		config := mkcpInteropClientConfig(t, v2rayPort.Port(), inboundPort, tlsMirrorInteropPort(echoAddr), userUUID, seed, header)
-		startTLSMirrorInteropV2Ray(t, v2rayBin, config, v2rayPort, net.JoinHostPort("127.0.0.1", fmt.Sprint(v2rayPort.Port())))
+		config := mkcpInteropClientConfig(t, v2rayPort.Port(), inboundPort, vmessInteropPort(echoAddr), userUUID, seed, header)
+		startVMessInteropV2Ray(t, v2rayBin, config, v2rayPort.Release, net.JoinHostPort("127.0.0.1", fmt.Sprint(v2rayPort.Port())))
 
-		tlsMirrorInteropRoundTripWithRetry(t, func() (net.Conn, error) {
+		vmessInteropRoundTripWithRetry(t, func() (net.Conn, error) {
 			return net.Dial("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(v2rayPort.Port())))
 		}, 128*1024)
 	})
@@ -90,7 +83,7 @@ func mkcpInteropTestCase(t *testing.T, v2rayBin, name, seed, header string) {
 
 func mkcpInteropServerConfig(t *testing.T, listenPort int, userID, seed, header string) []byte {
 	t.Helper()
-	config := tlsMirrorInteropBaseConfig()
+	config := vmessInteropBaseConfig()
 	config["inbounds"] = []any{map[string]any{
 		"protocol": "vmess",
 		"listen":   "127.0.0.1",
@@ -100,14 +93,14 @@ func mkcpInteropServerConfig(t *testing.T, listenPort int, userID, seed, header 
 		},
 		"streamSettings": mkcpInteropStreamConfig(seed, header),
 	}}
-	config["outbounds"] = []any{tlsMirrorInteropDirectOutbound()}
-	return tlsMirrorInteropMarshalJSONConfig(t, config)
+	config["outbounds"] = []any{vmessInteropDirectOutbound()}
+	return vmessInteropMarshalJSONConfig(t, config)
 }
 
 func mkcpInteropClientConfig(t *testing.T, listenPort, serverPort int, targetPort string, userID, seed, header string) []byte {
 	t.Helper()
-	targetPortValue := tlsMirrorInteropParsePort(t, targetPort)
-	config := tlsMirrorInteropBaseConfig()
+	targetPortValue := vmessInteropParsePort(t, targetPort)
+	config := vmessInteropBaseConfig()
 	config["inbounds"] = []any{map[string]any{
 		"protocol": "dokodemo-door",
 		"listen":   "127.0.0.1",
@@ -129,7 +122,7 @@ func mkcpInteropClientConfig(t *testing.T, listenPort, serverPort int, targetPor
 			},
 		},
 	}
-	return tlsMirrorInteropMarshalJSONConfig(t, config)
+	return vmessInteropMarshalJSONConfig(t, config)
 }
 
 func mkcpInteropStreamConfig(seed, header string) map[string]any {
@@ -166,64 +159,5 @@ func mkcpInteropHeaderConfig(header string) map[string]any {
 	}[header]
 	return map[string]any{
 		"@type": "types.v2fly.org/" + typeName,
-	}
-}
-
-func startMKCPInteropV2Ray(t *testing.T, v2rayBin string, config []byte, release func()) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, v2rayBin, "run", "-format=jsonv5")
-	var output bytes.Buffer
-	cmd.Stdin = bytes.NewReader(config)
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	release()
-	require.NoError(t, cmd.Start())
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-	waited := false
-	t.Cleanup(func() {
-		cancel()
-		if !waited {
-			<-done
-		}
-		if t.Failed() {
-			t.Log(output.String())
-		}
-	})
-	select {
-	case err := <-done:
-		waited = true
-		require.NoError(t, err, output.String())
-		t.Fatalf("v2ray exited before mKCP interop test started\n%s", output.String())
-	case <-time.After(300 * time.Millisecond):
-	}
-}
-
-type mkcpInteropReservedPacketPort struct {
-	pc   net.PacketConn
-	port int
-}
-
-func mkcpInteropReserveUDPPort(t *testing.T) *mkcpInteropReservedPacketPort {
-	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	port := pc.LocalAddr().(*net.UDPAddr).Port
-	reserved := &mkcpInteropReservedPacketPort{pc: pc, port: port}
-	t.Cleanup(reserved.Release)
-	return reserved
-}
-
-func (p *mkcpInteropReservedPacketPort) Port() int {
-	return p.port
-}
-
-func (p *mkcpInteropReservedPacketPort) Release() {
-	if p.pc != nil {
-		_ = p.pc.Close()
-		p.pc = nil
 	}
 }
