@@ -737,6 +737,32 @@ proxies: # socks5
       seed: "" # 启用 AES-GCM 认证时使用的种子，留空使用默认认证
       header: "" # 伪装包头，可选：none/srtp/utp/wechat-video/dtls/wireguard
 
+  - name: "vmess-mekya"
+    type: vmess
+    server: server
+    port: 443
+    uuid: uuid
+    alterId: 32
+    cipher: auto
+    network: mekya
+    tls: true
+    mekya-opts:
+      url: https://server:443/mekya
+      max-write-delay: 80 # 首包后的最大聚合等待时间，单位毫秒
+      max-request-size: 96000 # 单次 HTTP 请求的最大负载大小，单位字节
+      polling-interval-initial: 200 # 空轮询间隔，单位毫秒
+      h2-pool-size: 8 # HTTP/2 连接池大小
+      kcp:
+        mtu: 1350 # 最大传输单元
+        tti: 15 # 传输时间间隔，单位毫秒
+        uplink-capacity: 40 # 上行容量，单位 MB/s
+        downlink-capacity: 2000 # 下行容量，单位 MB/s
+        congestion: false # 是否启用拥塞控制
+        write-buffer: 67108864 # 写缓冲区大小，单位字节
+        read-buffer: 67108864 # 读缓冲区大小，单位字节
+        seed: "" # 启用 AES-GCM 认证时使用的种子，留空使用默认认证
+        header: "" # 伪装包头，可选：none/srtp/utp/wechat-video/dtls/wireguard
+
   - name: "vmess-h2"
     type: vmess
     server: server
@@ -1879,6 +1905,23 @@ listeners:
         alterId: 1
     # ws-path: "/" # 如果不为空则开启 websocket 传输层
     # grpc-service-name: "GunService" # 如果不为空则开启 grpc 传输层
+    # 如果填写 mekya-config 并设置 enable: true 则启用 v2ray 兼容的 Mekya 入站监听（不可与 mkcp/ws/grpc 同时使用）
+    # mekya-config:
+    #   enable: true
+    #   max-write-size: 10485760 # 单个响应写回的最大负载大小，单位字节
+    #   max-write-duration-ms: 5000 # 单个响应写回的最大持续时间，单位毫秒
+    #   max-simultaneous-write-connection: 128 # 同一会话允许同时等待写回的请求数
+    #   packet-writing-buffer: 65536 # 写包缓冲区大小
+    #   kcp:
+    #     mtu: 1350 # 最大传输单元
+    #     tti: 15 # 传输时间间隔，单位毫秒
+    #     uplink-capacity: 40 # 上行容量，单位 MB/s
+    #     downlink-capacity: 2000 # 下行容量，单位 MB/s
+    #     congestion: false # 是否启用拥塞控制
+    #     write-buffer: 67108864 # 写缓冲区大小，单位字节
+    #     read-buffer: 67108864 # 读缓冲区大小，单位字节
+    #     seed: "" # 启用 AES-GCM 认证时使用的种子，留空使用默认认证
+    #     header: "" # 伪装包头，可选：none/srtp/utp/wechat-video/dtls/wireguard
     # 如果填写 mkcp-config 并设置 enable: true 则启用 v2ray 兼容的 mKCP 入站监听
     # mkcp-config:
     #   enable: true
