@@ -718,6 +718,25 @@ proxies: # socks5
       # v2ray-http-upgrade: false
       # v2ray-http-upgrade-fast-open: false
 
+  - name: "vmess-mkcp"
+    type: vmess
+    server: server
+    port: 443
+    uuid: uuid
+    alterId: 32
+    cipher: auto
+    network: mkcp
+    mkcp-opts:
+      mtu: 1350 # 最大传输单元
+      tti: 50 # 传输时间间隔，单位毫秒
+      uplink-capacity: 5 # 上行容量，单位 MB/s
+      downlink-capacity: 20 # 下行容量，单位 MB/s
+      congestion: false # 是否启用拥塞控制
+      write-buffer: 2097152 # 写缓冲区大小，单位字节
+      read-buffer: 2097152 # 读缓冲区大小，单位字节
+      seed: "" # 启用 AES-GCM 认证时使用的种子，留空使用默认认证
+      header: "" # 伪装包头，可选：none/srtp/utp/wechat-video/dtls/wireguard
+
   - name: "vmess-h2"
     type: vmess
     server: server
@@ -1860,6 +1879,18 @@ listeners:
         alterId: 1
     # ws-path: "/" # 如果不为空则开启 websocket 传输层
     # grpc-service-name: "GunService" # 如果不为空则开启 grpc 传输层
+    # 如果填写 mkcp-config 并设置 enable: true 则启用 v2ray 兼容的 mKCP 入站监听
+    # mkcp-config:
+    #   enable: true
+    #   mtu: 1350 # 最大传输单元
+    #   tti: 50 # 传输时间间隔，单位毫秒
+    #   uplink-capacity: 5 # 上行容量，单位 MB/s
+    #   downlink-capacity: 20 # 下行容量，单位 MB/s
+    #   congestion: false # 是否启用拥塞控制
+    #   write-buffer: 2097152 # 写缓冲区大小，单位字节
+    #   read-buffer: 2097152 # 读缓冲区大小，单位字节
+    #   seed: "" # 启用 AES-GCM 认证时使用的种子，留空使用默认认证
+    #   header: "" # 伪装包头，可选：none/srtp/utp/wechat-video/dtls/wireguard
     # 下面两项如果填写则开启 tls（需要同时填写）
     # certificate: ./server.crt # 证书 PEM 格式，或者 证书的路径
     # private-key: ./server.key # 证书对应的私钥 PEM 格式，或者私钥路径
