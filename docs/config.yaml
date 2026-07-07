@@ -1891,8 +1891,8 @@ listeners:
     #     after-bytes: 0 # 传输指定字节后开始限速
     #     bytes-per-sec: 0 # 基准速率（字节/秒）
     #     burst-bytes-per-sec: 0 # 突发速率（字节/秒），大于 bytesPerSec 时生效
-    # 如果填写tlsmirror则开启tlsmirror（注意不可与certificate和private-key同时填写）
-    # tlsmirror:
+    # 如果填写tlsmirror-config则开启tlsmirror（注意不可与certificate和private-key同时填写）
+    # tlsmirror-config:
     #   dest: test.com:443
     #   primary-key: MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY= # 必填，32 字节主密钥的 base64 编码
     #   proxy: ""
