@@ -1418,6 +1418,28 @@ proxies: # socks5
     # udp-over-stream: false
     # udp-over-stream-version: 1
 
+  # shadowquic
+  - name: shadowquic
+    server: www.example.com
+    port: 10443
+    type: shadowquic
+    username: username
+    password: password
+    # sni: example.com
+    # alpn: [h3]
+    # quic-versions: [v1] # support v1/v2, default v1
+    # udp-over-stream: false # UDP over stream, default false
+    # zero-rtt: false # 官方 server 的 0-RTT 路径可能在 JLS 认证完成前读取用户状态（已确认影响 v0.3.11）；使用官方 server 时必须在服务端关闭 zero-rtt
+    # keep-alive-interval: 10000
+    # congestion-controller: bbr # Available: "cubic", "new_reno", "bbr". Default: "cubic"
+    # cwnd: 10 # default: 32
+    # bbr-profile: "" # Available: "standard", "conservative", "aggressive". Default: "standard"
+    # max-datagram-frame-size: 1400
+    # max-open-streams: 1024
+    # recv-window-conn: 0
+    # recv-window: 0
+    # disable-mtu-discovery: false
+
   # ShadowsocksR
   # The supported ciphers (encryption methods): all stream ciphers in ss
   # The supported obfses:
@@ -2091,6 +2113,35 @@ listeners:
     #  alpn:
     #    - h3
     #  max-udp-relay-packet-size: 1500
+
+  - name: shadowquic-in-1
+    type: shadowquic
+    port: 10822 # 支持使用ports格式，例如200,302 or 200,204,401-429,501-503
+    listen: 0.0.0.0
+    # routing-mark: 0 # 为监听socket设置routing-mark（仅支持linux）
+    # rule: sub-rule-name1 # 默认使用 rules，如果未找到 sub-rule 则直接使用 rules
+    # proxy: proxy # 如果不为空则直接将该入站流量交由指定 proxy 处理 (当 proxy 不为空时，这里的 proxy 名称必须合法，否则会出错)
+    users:
+      - username: username
+        password: password
+    jls-upstream:
+      addr: www.example.com:443 # 未通过 JLS 认证的连接将转发到该 QUIC 伪装上游
+      # sni: example.com # JLS 伪装目标 SNI，留空时从 addr 推导
+      # proxy: proxy # 伪装上游使用的代理
+      # rate-limit: 0 # 转发限速，单位 bit/s，0 表示不限速
+      # quic-version-probe: false # 在首次连接时探测伪装上游版本
+    # alpn:
+    #   - h3
+    # quic-versions: [v1] # 本机手动配置及探测失败时的版本；支持 v1/v2
+    # zero-rtt: true
+    # congestion-controller: bbr
+    # cwnd: 10 # default: 32
+    # bbr-profile: "" # Available: "standard", "conservative", "aggressive". Default: "standard"
+    # max-idle-time: 30000
+    # max-datagram-frame-size: 1400
+    # recv-window-conn: 0
+    # recv-window: 0
+    # disable-mtu-discovery: false
 
   - name: tunnel-in-1
     type: tunnel
