@@ -39,7 +39,8 @@ func WriteBrutalNegotiationRequest(w io.Writer, rx uint64) error {
 	buf[0] = CommandExtension
 	binary.BigEndian.PutUint64(buf[1:9], extensionOpcodeMihomoBrutal)
 	writeBrutalNegotiationFrame(buf[9:], 0, rx)
-	return writeFull(w, buf[:])
+	_, err := w.Write(buf[:])
+	return err
 }
 
 func ReadBrutalNegotiationRequest(r io.Reader) (uint64, error) {
@@ -54,7 +55,8 @@ func WriteBrutalNegotiationResponse(w io.Writer, rx uint64, rxAuto bool) error {
 		flags |= brutalNegotiationFlagRxAuto
 	}
 	writeBrutalNegotiationFrame(buf[:], flags, rx)
-	return writeFull(w, buf[:])
+	_, err := w.Write(buf[:])
+	return err
 }
 
 func ReadBrutalNegotiationResponse(r io.Reader) (rx uint64, rxAuto bool, err error) {
