@@ -1459,6 +1459,8 @@ proxies: # socks5
     # zero-rtt: false # 官方 server 的 0-RTT 路径可能在 JLS 认证完成前读取用户状态（已确认影响 v0.3.11）；使用官方 server 时必须在服务端关闭 zero-rtt
     # keep-alive-interval: 10000
     # congestion-controller: bbr # Available: "cubic", "new_reno", "bbr". Default: "cubic"
+    # up: 100 Mbps # enables brutal; client upload speed; requires mihomo ShadowQuic on both ends
+    # down: 100 Mbps # enables brutal; requested client download speed, capped by listener up; requires mihomo ShadowQuic on both ends
     # cwnd: 10 # default: 32
     # bbr-profile: "" # Available: "standard", "conservative", "aggressive". Default: "standard"
     # max-datagram-frame-size: 1400
@@ -2184,7 +2186,10 @@ listeners:
     #   - h3
     # quic-versions: [v1] # 本机手动配置及探测失败时的版本；支持 v1/v2
     # zero-rtt: true
-    # congestion-controller: bbr
+    # congestion-controller: bbr # Available: "cubic", "new_reno", "bbr". Default: "cubic"
+    # up: 100 Mbps # enables brutal; server upload/client download speed cap; requires mihomo ShadowQuic on both ends
+    # down: 100 Mbps # enables brutal; requested server download/client upload speed; requires mihomo ShadowQuic on both ends
+    # ignore-client-bandwidth: false # for brutal; ignore outbound down and use listener down/auto instead
     # cwnd: 10 # default: 32
     # bbr-profile: "" # Available: "standard", "conservative", "aggressive". Default: "standard"
     # max-idle-time: 30000
