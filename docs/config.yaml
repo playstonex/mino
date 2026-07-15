@@ -732,6 +732,10 @@ proxies: # socks5
     # shadow-tls-opts: # 需要 tls: true；使用 servername 作为 ShadowTLS SNI
     #   version: 3 # 支持 v1/v2/v3；留空时默认为 v2
     #   password: shadow-tls-password
+    # restls-opts: # 需要 tls: true；使用 servername 作为 Restls SNI
+    #   password: restls-password
+    #   version-hint: tls13 # 可选值：tls12、tls13
+    #   # restls-script: ""
     # jls-opts: # 需要 tls: true；使用 servername 作为 JLS SNI
     #   username: jls-user
     #   password: jls-password
@@ -876,6 +880,10 @@ proxies: # socks5
     # shadow-tls-opts: # 需要 tls: true；使用 servername 作为 ShadowTLS SNI
     #   version: 3 # 支持 v1/v2/v3；留空时默认为 v2
     #   password: shadow-tls-password
+    # restls-opts: # 需要 tls: true；使用 servername 作为 Restls SNI
+    #   password: restls-password
+    #   version-hint: tls13 # 可选值：tls12、tls13
+    #   # restls-script: ""
     # jls-opts: # 需要 tls: true；使用 servername 作为 JLS SNI
     #   username: jls-user
     #   password: jls-password
@@ -1093,6 +1101,10 @@ proxies: # socks5
     # shadow-tls-opts: # 使用 sni 作为 ShadowTLS SNI
     #   version: 3 # 支持 v1/v2/v3；留空时默认为 v2
     #   password: shadow-tls-password
+    # restls-opts: # 使用 sni 作为 Restls SNI
+    #   password: restls-password
+    #   version-hint: tls13 # 可选值：tls12、tls13
+    #   # restls-script: ""
     # jls-opts: # 使用 sni 作为 JLS SNI
     #   username: jls-user
     #   password: jls-password
@@ -2123,6 +2135,13 @@ listeners:
     #   handshake:
     #     dest: www.example.com:443
     #     # proxy: ""
+    # res-tls:
+    #   enable: true
+    #   dest: www.example.com:443
+    #   password: restls-password
+    #   # restls-script: ""
+    #   # min-record-len: 0
+    #   # proxy: ""
     # 如果填写reality-config则开启reality（注意不可与certificate和private-key同时填写）
     # reality-config:
     #   dest: test.com:443
@@ -2331,7 +2350,14 @@ listeners:
     #   handshake:
     #     dest: www.example.com:443
     #     # proxy: ""
-    ### 注意，对于vless listener, 如果 "allow-insecure" 不为 true, 至少需要填写 “certificate和private-key” 或 “shadow-tls” 或 “jls-config” 或 “reality-config” 或 “decryption” 的其中一项 ###
+    # res-tls:
+    #   enable: true
+    #   dest: www.example.com:443
+    #   password: restls-password
+    #   # restls-script: ""
+    #   # min-record-len: 0
+    #   # proxy: ""
+    ### 注意，对于vless listener, 如果 "allow-insecure" 不为 true, 至少需要填写 “certificate和private-key” 或 “shadow-tls” 或 “res-tls” 或 “jls-config” 或 “reality-config” 或 “decryption” 的其中一项 ###
     # allow-insecure: false # 是否允许不开启tls加密（注意：仅用于有 nginx, caddy 前置的情况）
 
   - name: anytls-in-1
@@ -2452,6 +2478,13 @@ listeners:
     #   handshake:
     #     dest: www.example.com:443
     #     # proxy: ""
+    # res-tls:
+    #   enable: true
+    #   dest: www.example.com:443
+    #   password: restls-password
+    #   # restls-script: ""
+    #   # min-record-len: 0
+    #   # proxy: ""
     # jls-config: # JLS 替代普通 TLS；未认证连接回落到 dest
     #   enable: true
     #   users:
@@ -2484,7 +2517,7 @@ listeners:
     #   enabled: false
     #   method: aes-128-gcm # aes-128-gcm/aes-256-gcm/chacha20-ietf-poly1305
     #   password: "example"
-    ### 注意，对于trojan listener, 如果 "allow-insecure" 不为 true, 至少需要填写 “certificate和private-key” 或 “shadow-tls” 或 “jls-config” 或 “reality-config” 或 “ss-option” 的其中一项 ###
+    ### 注意，对于trojan listener, 如果 "allow-insecure" 不为 true, 至少需要填写 “certificate和private-key” 或 “shadow-tls” 或 “res-tls” 或 “jls-config” 或 “reality-config” 或 “ss-option” 的其中一项 ###
     # allow-insecure: false # 是否允许不开启tls加密（注意：仅用于有 nginx, caddy 前置的情况）
 
   - name: hysteria2-in-1
