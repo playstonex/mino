@@ -410,7 +410,7 @@ proxies: # socks5
     # udp: true # support UDP on version 3/4/5
     # reuse: false # v4/5 only
     # obfs-opts:
-    #   mode: http # or tls/shadow-tls
+    #   mode: http # or tls/shadow-tls/restls/jls
 
   - name: "snell-shadow-tls"
     type: snell
@@ -427,6 +427,32 @@ proxies: # socks5
       password: "shadow_tls_password"
       version: 2 # support 1/2/3
       alpn: ["h2","http/1.1"]
+
+  - name: "snell-restls"
+    type: snell
+    server: server
+    port: 44046
+    psk: yourpsk
+    # version: 4 # support 1/2/3/4/5
+    # client-fingerprint: chrome
+    obfs-opts:
+      mode: restls
+      host: bing.com
+      password: "restls_password"
+      version-hint: tls13
+
+  - name: "snell-jls"
+    type: snell
+    server: server
+    port: 44046
+    psk: yourpsk
+    # version: 4 # support 1/2/3/4/5
+    # client-fingerprint: chrome
+    obfs-opts:
+      mode: jls
+      host: bing.com
+      username: jls-user
+      password: "jls_password"
 
   # Shadowsocks
   # cipher支持:
@@ -2063,6 +2089,17 @@ listeners:
     #       password: password
     #   handshake:
     #     dest: test.com:443
+    # res-tls:
+    #   enable: false
+    #   dest: test.com:443
+    #   password: restls-password
+    # jls-config:
+    #   enable: false
+    #   users:
+    #     - username: jls-user
+    #       password: jls-password
+    #   dest: test.com:443
+    ## shadow-tls, res-tls and jls-config are mutually exclusive
     # rule: sub-rule-name1
     # proxy: proxy
 
