@@ -44,6 +44,7 @@ type Resolver struct {
 	fallback              []dnsClient
 	fallbackDomainFilters []C.DomainMatcher
 	fallbackIPFilters     []C.IpMatcher
+	fallbackLazyQuery     bool
 	group                 singleflight.Group[*D.Msg]
 	cache                 dnsCache
 	policy                []dnsPolicy
@@ -334,6 +335,11 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 		}
 	}
 
+	var fallbackMsg <-chan *result
+	if !r.fallbackLazyQuery {
+		fallbackMsg = r.asyncExchange(ctx, r.fallback, m)
+	}
+	
 	var res *result
 	select {
 	case res = <-msgCh:
@@ -352,8 +358,12 @@ func (r *Resolver) ipExchange(ctx context.Context, m *D.Msg) (msg *D.Msg, err er
 		}
 	}
 
+	if fallbackMsg == nil {
+		fallbackMsg = r.asyncExchange(ctx, r.fallback, m)
+	}
+	
 	select {
-	case res = <-r.asyncExchange(ctx, r.fallback, m):
+	case res = <-fallbackMsg:
 		msg, err = res.Msg, res.Error
 		return
 	case <-ctx.Done():
@@ -479,6 +489,7 @@ type Config struct {
 	IPv6Timeout          uint
 	FallbackIPFilter     []C.IpMatcher
 	FallbackDomainFilter []C.DomainMatcher
+	FallbackLazyQuery    bool
 	Policy               []Policy
 	ProxyServerPolicy    []Policy
 	CacheAlgorithm       string
@@ -620,6 +631,7 @@ func NewResolver(config Config) (rs Resolvers) {
 		r.fallback = cacheTransform(config.Fallback)
 		r.fallbackIPFilters = config.FallbackIPFilter
 		r.fallbackDomainFilters = config.FallbackDomainFilter
+		r.fallbackLazyQuery = config.FallbackLazyQuery
 	}
 
 	return

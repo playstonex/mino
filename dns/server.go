@@ -5,9 +5,9 @@ import (
 	"net"
 	"sync"
 
-	"github.com/metacubex/mihomo/adapter/inbound"
 	"github.com/metacubex/mihomo/common/sockopt"
 	"github.com/metacubex/mihomo/component/resolver"
+	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
 	D "github.com/miekg/dns"
@@ -48,7 +48,7 @@ func (s *Server) SetService(service resolver.Service) {
 	s.service = service
 }
 
-func ReCreateServer(addr string, service resolver.Service) {
+func ReCreateServer(addr string, lc C.InboundListenConfig, service resolver.Service) {
 	dnsMu.Lock()
 	defer dnsMu.Unlock()
 
@@ -70,7 +70,7 @@ func ReCreateServer(addr string, service resolver.Service) {
 	server.service = nil
 	address = ""
 
-	if addr == "" || service == nil {
+	if addr == "" || lc == nil || service == nil {
 		return
 	}
 
@@ -90,7 +90,7 @@ func ReCreateServer(addr string, service resolver.Service) {
 	server = &Server{service: service}
 
 	go func() {
-		p, err := inbound.ListenPacket("udp", addr)
+		p, err := lc.ListenPacket(context.Background(), "udp", addr)
 		if err != nil {
 			log.Errorln("Start DNS server(UDP) error: %s", err.Error())
 			return
@@ -106,7 +106,7 @@ func ReCreateServer(addr string, service resolver.Service) {
 	}()
 
 	go func() {
-		l, err := inbound.Listen("tcp", addr)
+		l, err := lc.Listen(context.Background(), "tcp", addr)
 		if err != nil {
 			log.Errorln("Start DNS server(TCP) error: %s", err.Error())
 			return

@@ -117,7 +117,7 @@ func (o *OpenConnect) ListenPacketContext(ctx context.Context, metadata *C.Metad
 	if pc == nil {
 		return nil, errors.New("packetConn is nil")
 	}
-	return newPacketConn(pc, o), nil
+	return NewPacketConn(pc, o), nil
 }
 
 func (o *OpenConnect) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {

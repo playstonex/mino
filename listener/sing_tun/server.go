@@ -199,6 +199,7 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 	} else {
 		udpTimeout = sing.UDPTimeout
 	}
+
 	tableIndex := options.IPRoute2TableIndex
 	if tableIndex == 0 {
 		tableIndex = tun.DefaultIPRoute2TableIndex
