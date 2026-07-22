@@ -183,3 +183,5 @@ replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20
 replace github.com/WarrDoge/sslcon => ./transport/openconnect/sslcon
 
 replace github.com/wlynxg/anet => ./vendor/fixed/anet
+
+replace github.com/playstonex/sing-tun => ../sing-tun

@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git merge:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(go mod download:*)",
+      "Bash(go install:*)",
+      "Bash(gomobile version:*)",
+      "Bash(gomobile init:*)",
+      "Bash(chmod:*)",
+      "Bash(./build_xframework.sh:*)",
+      "Bash(gomobile bind:*)",
+      "Bash(GODEBUG=gctrace=1 ./build_xframework.sh:*)",
+      "Bash(go:*)",
+      "Bash(find:*)",
+      "Bash(xcodebuild:*)",
+      "Bash(plutil:*)",
+      "Bash(ls:*)",
+      "Bash(du:*)",
+      "Bash(git restore:*)",
+      "Bash(git push:*)",
+      "Bash(gofmt *)",
+      "Bash(git show *)",
+      "Read(//tmp/**)",
+      "Bash(awk '/^func \\\\\\(m \\\\*OverlayManager\\\\\\) pollRemoteSignaling/,/^func /' /Volumes/y/lei/Projects/loyang/Violet/extend/mihomo/mate/overlay_manager.go)",
+      "Bash(git mv *)",
+      "Bash(grep -n \"^mihomo$\\\\|^/mihomo$\\\\|bin/mihomo\" /Volumes/y/lei/Projects/loyang/Violet/extend/mihomo/.gitignore)"
+    ]
+  }
+}
