@@ -185,7 +185,7 @@ func (p *P2P) getRelayPacketConn(ctx context.Context) (net.PacketConn, error) {
 	// Release lock during potentially slow network operations.
 	relayMu.Unlock()
 
-	rc, err := p2p.NewRelayClient(p.relayEndpoint, p.accessToken, p.localDeviceID)
+	rc, err := p2p.NewRelayClient(p.relayEndpoint, p.accessToken, p.localDeviceID, nil)
 	if err != nil {
 		return nil, fmt.Errorf("P2P relay connect: %w", err)
 	}

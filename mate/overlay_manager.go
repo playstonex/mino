@@ -354,6 +354,10 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 	m.platform = platform
 	m.tunFd = cfg.TunnelFd
 
+	// Ensure the overlay transport can protect its relay socket (Android
+	// hybrid mode) even when mihomo.Start() was not called (overlay-only).
+	globalOverlayTransport.SetPlatform(platform)
+
 	// 2. Decode and validate private key
 	privateKeyBytes, err := base64.StdEncoding.DecodeString(cfg.PrivateKeyBase64)
 	if err != nil {

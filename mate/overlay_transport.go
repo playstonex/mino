@@ -82,6 +82,25 @@ func (m *overlayTransportManager) SetPlatform(platform PlatformInterface) {
 	m.platform = platform
 }
 
+// buildSocketProtector returns a function that protects a socket fd via the
+// platform (Android VpnService.protect) so relay/control traffic bypasses the
+// TUN. Returns nil when no platform is available (overlay-only mode on Android
+// does not need this since the TUN only routes the overlay subnet).
+func (m *overlayTransportManager) buildSocketProtector() func(fd int) error {
+	m.mu.RLock()
+	platform := m.platform
+	m.mu.RUnlock()
+	if platform == nil {
+		return nil
+	}
+	return func(fd int) error {
+		if !platform.SocketProtect(int32(fd)) {
+			return fmt.Errorf("SocketProtect returned false for fd %d", fd)
+		}
+		return nil
+	}
+}
+
 // SetPacketHandler sets the callback for handling received overlay packets.
 func (m *overlayTransportManager) SetPacketHandler(handler func(peerID string, payload []byte)) {
 	m.mu.Lock()
@@ -255,7 +274,7 @@ func (m *overlayTransportManager) ensureRelay() (*p2p.RelayClient, error) {
 		return nil, fmt.Errorf("overlay relay is not configured")
 	}
 
-	relayClient, err := p2p.NewRelayClient(relayEndpoint, accessToken, localDeviceID)
+	relayClient, err := p2p.NewRelayClient(relayEndpoint, accessToken, localDeviceID, m.buildSocketProtector())
 	if err != nil {
 		m.relayFailCount++
 		m.relayLastFail = time.Now()

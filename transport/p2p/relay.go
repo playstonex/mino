@@ -39,7 +39,12 @@ type RelayClient struct {
 }
 
 // NewRelayClient creates a new relay client.
-func NewRelayClient(endpoint string, token string, deviceUUID string) (*RelayClient, error) {
+//
+// protect, when non-nil, is applied to the relay UDP socket file descriptor
+// immediately after it is created (before any traffic). On Android this calls
+// VpnService.protect() so relay traffic bypasses the TUN interface in hybrid
+// mode (where the default route otherwise captures it into the tunnel).
+func NewRelayClient(endpoint string, token string, deviceUUID string, protect func(fd int) error) (*RelayClient, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("relay resolve endpoint: %w", err)
@@ -48,6 +53,13 @@ func NewRelayClient(endpoint string, token string, deviceUUID string) (*RelayCli
 	conn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
 		return nil, fmt.Errorf("relay connect: %w", err)
+	}
+
+	if protect != nil {
+		if err := protectConn(conn, protect); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("relay socket protect: %w", err)
+		}
 	}
 
 	rc := &RelayClient{
@@ -296,4 +308,23 @@ func hexVal(c byte) int {
 	default:
 		return -1
 	}
+}
+
+// protectConn applies the protect callback to the underlying file descriptor
+// of a UDP connection. Used on Android to route the relay socket around the
+// VPN TUN (VpnService.protect).
+func protectConn(conn *net.UDPConn, protect func(fd int) error) error {
+	sc, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var sockErr error
+	if err := sc.Control(func(fd uintptr) {
+		if e := protect(int(fd)); e != nil {
+			sockErr = e
+		}
+	}); err != nil {
+		return err
+	}
+	return sockErr
 }
