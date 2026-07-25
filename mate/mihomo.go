@@ -11,8 +11,6 @@ import (
 
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/component/dialer"
-	"github.com/metacubex/mihomo/component/resolver"
-	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/p2p"
 	"github.com/metacubex/mihomo/tunnel/statistic"
@@ -126,11 +124,11 @@ func Close() error {
 	return nil
 }
 
-func UpdateSystemDNS(addr string) {
-	dns.UpdateSystemDNS([]string{addr})
-	resolver.ClearCache()
-	resolver.ResetConnection()
-}
+// func UpdateSystemDNS(addr string) {
+// 	dns.UpdateSystemDNS([]string{addr})
+// 	resolver.ClearCache()
+// 	resolver.ResetConnection()
+// }
 
 type MonitorConnection struct {
 	ID                string `json:"id"`

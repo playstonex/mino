@@ -1,6 +1,6 @@
 module github.com/metacubex/mihomo
 
-go 1.24.2
+go 1.25.0
 
 require (
 	github.com/WarrDoge/sslcon v0.0.0-00010101000000-000000000000
@@ -70,11 +70,11 @@ require (
 	github.com/mdlayher/netlink v1.7.2
 	github.com/miekg/dns v1.1.63
 	github.com/oschwald/maxminddb-golang v1.12.0
-	golang.org/x/crypto v0.48.0
+	golang.org/x/crypto v0.54.0
 	golang.org/x/exp v0.0.0-20240904232852-e7e105dedf7e
-	golang.org/x/net v0.50.0
-	golang.org/x/sync v0.19.0
-	golang.org/x/sys v0.41.0
+	golang.org/x/net v0.57.0
+	golang.org/x/sync v0.22.0
+	golang.org/x/sys v0.47.0
 	google.golang.org/protobuf v1.34.2
 )
 
@@ -168,12 +168,13 @@ require (
 	gitlab.com/yawning/bsaes.git v0.0.0-20190805113838-0a714cd429ec // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
-	golang.org/x/mod v0.32.0 // indirect
+	golang.org/x/mobile v0.0.0-20260709172247-6129f5bee9d5 // indirect
+	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/oauth2 v0.24.0 // indirect
-	golang.org/x/term v0.40.0 // indirect
-	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/term v0.45.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
-	golang.org/x/tools v0.41.0 // indirect
+	golang.org/x/tools v0.48.0 // indirect
 	golang.zx2c4.com/wireguard/windows v0.5.3 // indirect
 )
 
@@ -182,6 +183,6 @@ replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20
 
 replace github.com/WarrDoge/sslcon => ./transport/openconnect/sslcon
 
-replace github.com/wlynxg/anet => ./vendor/fixed/anet
-
 replace github.com/playstonex/sing-tun => ../sing-tun
+
+tool golang.org/x/mobile/cmd/gobind

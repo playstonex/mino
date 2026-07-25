@@ -106,7 +106,7 @@ func (p *P2P) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.
 	}
 
 	// We need to store the target destination so WriteTo knows where to send if we don't encode it per-packet
-	return newPacketConn(conn, p), nil
+	return NewPacketConn(conn, p), nil
 }
 
 func (p *P2P) SupportUOT() bool {
