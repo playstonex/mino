@@ -54,6 +54,7 @@ const (
 	Tailscale
 	OpenConnect
 	P2P
+	ZeroTier
 	GostRelay
 )
 
@@ -240,6 +241,8 @@ func (at AdapterType) String() string {
 		return "OpenConnect"
 	case P2P:
 		return "P2P"
+	case ZeroTier:
+		return "ZeroTier"
 	case GostRelay:
 		return "GostRelay"
 	case Relay:
