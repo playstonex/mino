@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -235,6 +236,15 @@ func (o *OpenConnect) run(ctx context.Context) error {
 				dnsServers = append(dnsServers, d)
 			}
 		}
+		// Always keep public resolvers as backup — server-provided DNS may be
+		// absent or unusable. All nameservers race and the fastest valid
+		// answer wins, so healthy entries keep serving while dead ones lose.
+		for _, backup := range []string{"8.8.8.8", "1.1.1.1"} {
+			if !slices.Contains(dnsServers, backup) {
+				dnsServers = append(dnsServers, backup)
+			}
+		}
+		log.Infoln("[OpenConnect](%s) remote DNS servers: %v (server provided: %v)", o.name, dnsServers, tunnel.DNS())
 		if len(dnsServers) > 0 {
 			nss, err := dns.ParseNameServer(dnsServers)
 			if err != nil {
