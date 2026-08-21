@@ -7,3 +7,4 @@ mihomo.egg-info
 # go.work is generated dynamically by build_xframework.sh
 go.work
 go.work.sum.claude/
+.DS_Store
