@@ -82,7 +82,9 @@ ensure_gomobile() {
     if [ ! -d "$MOBILE_DIR/bind" ]; then
         echo_info "golang.org/x/mobile/bind not found. Installing..."
         mkdir -p "$MOBILE_DIR"
-        git clone --depth 1 https://go.googlesource.com/mobile "$MOBILE_DIR"
+        git clone https://go.googlesource.com/mobile "$MOBILE_DIR"
+        # Keep in sync with the pin in build_xframework.sh and CI.
+        git -C "$MOBILE_DIR" checkout 68735029466e0b69a0c5b27f4811255254750ac3
     fi
     
     # Check for go.work

@@ -31,8 +31,11 @@ jobs:
 
       - name: Install gomobile
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
-          go install golang.org/x/mobile/cmd/gobind@latest
+          # Pin to the last x/mobile revision verified to work with
+          # gomobile bind under a go.work workspace (master regressed:
+          # "go mod tidy failed / missing module declaration").
+          go install golang.org/x/mobile/cmd/gomobile@6873502
+          go install golang.org/x/mobile/cmd/gobind@6873502
           gomobile init
 
       - name: Build XCFramework

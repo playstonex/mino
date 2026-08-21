@@ -152,11 +152,16 @@ export TMPDIR="$(cd "$WORK_TMP_DIR" && pwd)/"
 export GOMOBILE="$(cd "$GOMOBILE_CACHE_DIR" && pwd)"
 
 # Ensure GOPATH/mobile is set up
+# Pinned x/mobile revision: master regressed gomobile bind under go.work
+# ("go mod tidy failed / missing module declaration"). Keep in sync with
+# the pin in .github/workflows/build-xcframework.yml.
+X_MOBILE_COMMIT="68735029466e0b69a0c5b27f4811255254750ac3"
 MOBILE_DIR="$(go env GOPATH)/src/golang.org/x/mobile"
 if [ ! -d "$MOBILE_DIR/bind" ]; then
     echo_error "golang.org/x/mobile/bind not found. Installing..."
     mkdir -p "$MOBILE_DIR"
-    git clone --depth 1 https://go.googlesource.com/mobile "$MOBILE_DIR"
+    git clone https://go.googlesource.com/mobile "$MOBILE_DIR"
+    git -C "$MOBILE_DIR" checkout "$X_MOBILE_COMMIT"
 fi
 
 # Check for go.work
