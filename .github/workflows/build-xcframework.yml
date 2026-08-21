@@ -19,15 +19,32 @@ jobs:
     permissions:
       contents: write
 
+    defaults:
+      run:
+        working-directory: mihomo
+
     steps:
       - name: Checkout mihomo
         uses: actions/checkout@v5
+        with:
+          path: mihomo
+
+      # mihomo go.mod replaces github.com/playstonex/sing-tun with ../sing-tun,
+      # so the fork must be checked out next to it or every go command fails
+      # (which surfaced as "go mod tidy failed / missing module declaration").
+      - name: Checkout sing-tun (local replace)
+        uses: actions/checkout@v5
+        with:
+          repository: playstonex/sing-tun
+          ref: meta
+          path: sing-tun
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version: "1.25"
           cache: true
+          cache-dependency-path: mihomo/go.sum
 
       - name: Install gomobile
         run: |
@@ -79,8 +96,8 @@ jobs:
             ### Usage in Violet
             Update `Violet/library/mate_version.txt` to `${{ env.RELEASE_TAG }}`
           files: |
-            build/xframework/Mate.xcframework.zip
-            build/xframework/Mate.xcframework.zip.sha256
+            mihomo/build/xframework/Mate.xcframework.zip
+            mihomo/build/xframework/Mate.xcframework.zip.sha256
           prerelease: ${{ github.event_name != 'workflow_dispatch' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
