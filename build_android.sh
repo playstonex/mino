@@ -5,18 +5,22 @@
 
 set -e
 
-# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PACKAGE="github.com/metacubex/mihomo/mate"
 LIBRARY_NAME="mate"
-OUTPUT_DIR="./build/android"
-TEMP_DIR="./build/android/.temp"
+OUTPUT_DIR="$SCRIPT_DIR/build/android"
+TEMP_DIR="$OUTPUT_DIR/.temp"
 WORK_TMP_DIR=""
-GOMOBILE_CACHE_DIR="./build/gomobile"
+GOMOBILE_CACHE_DIR="$SCRIPT_DIR/build/gomobile"
 BUILD_TAGS="with_gvisor,cmfa"
 BUILD_TYPE="${1:-all}"
 
 # Android SDK path (auto-detect or set manually)
-ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}"
+if [ -d "$HOME/Library/Android/sdk" ]; then
+    ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}"
+else
+    ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}"
+fi
 ANDROID_NDK_VERSION="25.2.9519653"
 ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
 ANDROID_MIN_SDK=21
@@ -69,22 +73,15 @@ mkdir -p "$GOMOBILE_CACHE_DIR"
 export TMPDIR="$(cd "$WORK_TMP_DIR" && pwd)/"
 export GOMOBILE="$(cd "$GOMOBILE_CACHE_DIR" && pwd)"
 
-# Ensure gomobile is installed
 ensure_gomobile() {
-    if ! command -v gomobile &> /dev/null; then
-        echo_info "Installing gomobile..."
-        go install golang.org/x/mobile/cmd/gomobile@latest
-        go install golang.org/x/mobile/cmd/gobind@latest
-        gomobile init
-    fi
-    
     MOBILE_DIR="$(go env GOPATH)/src/golang.org/x/mobile"
     if [ ! -d "$MOBILE_DIR/bind" ]; then
         echo_info "golang.org/x/mobile/bind not found. Installing..."
         mkdir -p "$MOBILE_DIR"
         git clone https://go.googlesource.com/mobile "$MOBILE_DIR"
-        # Keep in sync with the pin in build_xframework.sh and CI.
         git -C "$MOBILE_DIR" checkout 68735029466e0b69a0c5b27f4811255254750ac3
+        (cd "$MOBILE_DIR" && go install ./cmd/gomobile ./cmd/gobind)
+        gomobile init
     fi
     
     # Check for go.work
@@ -136,12 +133,13 @@ build_android() {
     mkdir -p "$build_output"
     
     CGO_ENABLED=1 \
+    CGO_LDFLAGS="-Wl,-z,max-page-size=16384" \
     gomobile bind \
         -androidapi=$ANDROID_MIN_SDK \
         -tags="$BUILD_TAGS" \
         -target="$target_flag" \
         -o "$build_output/${LIBRARY_NAME}.aar" \
-        -ldflags='-s -w' \
+        -ldflags='-checklinkname=0 -s -w -extldflags "-Wl,-z,max-page-size=16384"' \
         "$PACKAGE"
     
     echo_info "✅ Built AAR for $target_arch at $build_output/${LIBRARY_NAME}.aar"
