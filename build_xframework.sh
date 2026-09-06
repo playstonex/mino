@@ -177,6 +177,18 @@ use (
 EOF
 fi
 
+if [ -d "../sing-tun" ] && ! grep -q "replace github.com/playstonex/sing-tun" go.work; then
+    cat >> go.work << EOF
+
+replace github.com/playstonex/sing-tun => ../sing-tun
+EOF
+fi
+
+GOMOBILE_BIN="gomobile"
+if command -v gomobile-netbird >/dev/null 2>&1; then
+    GOMOBILE_BIN="gomobile-netbird"
+fi
+
 # Build for macOS
 build_macos() {
     echo_info "Building macOS XCFramework (universal)..."
@@ -360,9 +372,112 @@ EOF
     echo_info "✅ iOS XCFramework created: $OUTPUT_DIR/${FRAMEWORK_NAME}_iOS.xcframework"
 }
 
+# Build for tvOS
+build_tvos() {
+    echo_info "Building tvOS XCFramework (arm64 + simulator)..."
+    local tvos_arm64_framework="$TEMP_DIR/tvos_arm64"
+    local tvos_sim_arm64_framework="$TEMP_DIR/tvos_sim_arm64"
+    local tvos_sim_amd64_framework="$TEMP_DIR/tvos_sim_amd64"
+    mkdir -p "$tvos_arm64_framework" "$tvos_sim_arm64_framework" "$tvos_sim_amd64_framework"
+
+    # Build tvOS arm64
+    echo_info "  - Building for tvOS/arm64..."
+    GOOS=ios GOARCH=arm64 CGO_ENABLED=1 \
+    $GOMOBILE_BIN bind -tvosversion=17.0 \
+        -tags="$BUILD_TAGS" \
+        -target=tvos/arm64 \
+        -o "$tvos_arm64_framework/${FRAMEWORK_NAME}_tvos_arm64.xcframework" \
+        -ldflags='-s -w' \
+        "$PACKAGE"
+
+    # Build tvOS simulator arm64
+    echo_info "  - Building for tvOS simulator/arm64..."
+    GOOS=ios GOARCH=arm64 CGO_ENABLED=1 \
+    $GOMOBILE_BIN bind -tvosversion=17.0 \
+        -tags="$BUILD_TAGS" \
+        -target=tvossimulator/arm64 \
+        -o "$tvos_sim_arm64_framework/${FRAMEWORK_NAME}_tvos_sim_arm64.xcframework" \
+        -ldflags='-s -w' \
+        "$PACKAGE"
+
+    # Build tvOS simulator amd64
+    echo_info "  - Building for tvOS simulator/amd64..."
+    GOOS=ios GOARCH=amd64 CGO_ENABLED=1 \
+    $GOMOBILE_BIN bind -tvosversion=17.0 \
+        -tags="$BUILD_TAGS" \
+        -target=tvossimulator/amd64 \
+        -o "$tvos_sim_amd64_framework/${FRAMEWORK_NAME}_tvos_sim_amd64.xcframework" \
+        -ldflags='-s -w' \
+        "$PACKAGE"
+
+    mkdir -p "$OUTPUT_DIR/${FRAMEWORK_NAME}_tvOS.xcframework"
+    cp -R "$tvos_arm64_framework/${FRAMEWORK_NAME}_tvos_arm64.xcframework/tvos-arm64" \
+        "$OUTPUT_DIR/${FRAMEWORK_NAME}_tvOS.xcframework/"
+    normalize_ios_framework_slice "$OUTPUT_DIR/${FRAMEWORK_NAME}_tvOS.xcframework/tvos-arm64"
+
+    mkdir -p "$OUTPUT_DIR/${FRAMEWORK_NAME}_tvOS.xcframework/tvos-arm64_x86_64-simulator"
+    cp -R "$tvos_sim_arm64_framework/${FRAMEWORK_NAME}_tvos_sim_arm64.xcframework/tvos-arm64-simulator/${FRAMEWORK_NAME}_tvos_sim_arm64.framework" \
+        "$OUTPUT_DIR/${FRAMEWORK_NAME}_tvOS.xcframework/tvos-arm64_x86_64-simulator/${FRAMEWORK_NAME}.framework"
+
+    lipo -create \
+        "$tvos_sim_arm64_framework/${FRAMEWORK_NAME}_tvos_sim_arm64.xcframework/tvos-arm64-simulator/${FRAMEWORK_NAME}_tvos_sim_arm64.framework/${FRAMEWORK_NAME}_tvos_sim_arm64" \
+        "$tvos_sim_amd64_framework/${FRAMEWORK_NAME}_tvos_sim_amd64.xcframework/tvos-x86_64-simulator/${FRAMEWORK_NAME}_tvos_sim_amd64.framework/${FRAMEWORK_NAME}_tvos_sim_amd64" \
+        -output "$OUTPUT_DIR/${FRAMEWORK_NAME}_tvOS.xcframework/tvos-arm64_x86_64-simulator/${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}"
+
+    normalize_ios_framework_slice "$OUTPUT_DIR/${FRAMEWORK_NAME}_tvOS.xcframework/tvos-arm64_x86_64-simulator"
+
+    cat > "$OUTPUT_DIR/${FRAMEWORK_NAME}_tvOS.xcframework/Info.plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>AvailableLibraries</key>
+    <array>
+        <dict>
+            <key>BinaryPath</key>
+            <string>${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}</string>
+            <key>LibraryIdentifier</key>
+            <string>tvos-arm64</string>
+            <key>LibraryPath</key>
+            <string>${FRAMEWORK_NAME}.framework</string>
+            <key>SupportedArchitectures</key>
+            <array>
+                <string>arm64</string>
+            </array>
+            <key>SupportedPlatform</key>
+            <string>tvos</string>
+        </dict>
+        <dict>
+            <key>BinaryPath</key>
+            <string>${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}</string>
+            <key>LibraryIdentifier</key>
+            <string>tvos-arm64_x86_64-simulator</string>
+            <key>LibraryPath</key>
+            <string>${FRAMEWORK_NAME}.framework</string>
+            <key>SupportedArchitectures</key>
+            <array>
+                <string>arm64</string>
+                <string>x86_64</string>
+            </array>
+            <key>SupportedPlatform</key>
+            <string>tvos</string>
+            <key>SupportedPlatformVariant</key>
+            <string>simulator</string>
+        </dict>
+    </array>
+    <key>CFBundlePackageType</key>
+    <string>XFWK</string>
+    <key>XCFrameworkFormatVersion</key>
+    <string>1.0</string>
+</dict>
+</plist>
+EOF
+    echo_info "✅ tvOS XCFramework created: $OUTPUT_DIR/${FRAMEWORK_NAME}_tvOS.xcframework"
+}
+
 # Build unified XCFramework with all platforms
 build_unified() {
-    echo_info "Building unified XCFramework with iOS and macOS support..."
+    echo_info "Building unified XCFramework with iOS, macOS, and tvOS support..."
     
     # First build all platforms
     echo_info "Step 1: Building all platforms..."
@@ -370,13 +485,17 @@ build_unified() {
     local ios_sim_framework="$TEMP_DIR/ios_simulator"
     local macos_arm64_framework="$TEMP_DIR/macos_arm64"
     local macos_amd64_framework="$TEMP_DIR/macos_amd64"
+    local tvos_arm64_framework="$TEMP_DIR/tvos_arm64"
+    local tvos_sim_arm64_framework="$TEMP_DIR/tvos_sim_arm64"
+    local tvos_sim_amd64_framework="$TEMP_DIR/tvos_sim_amd64"
     
-    mkdir -p "$ios_arm64_framework" "$ios_sim_framework" "$macos_arm64_framework" "$macos_amd64_framework"
+    mkdir -p "$ios_arm64_framework" "$ios_sim_framework" "$macos_arm64_framework" "$macos_amd64_framework" \
+             "$tvos_arm64_framework" "$tvos_sim_arm64_framework" "$tvos_sim_amd64_framework"
     
     # Build iOS arm64
     echo_info "  - Building for iOS/arm64..."
     GOOS=ios GOARCH=arm64 CGO_ENABLED=1 \
-    gomobile bind -iosversion=13.0 \
+    $GOMOBILE_BIN bind -iosversion=13.0 \
         -tags="$BUILD_TAGS" \
         -target=ios/arm64 \
         -o "$ios_arm64_framework/${FRAMEWORK_NAME}_ios_arm64.xcframework" \
@@ -386,7 +505,7 @@ build_unified() {
     # Build iOS simulator
     echo_info "  - Building for iOS simulator/arm64..."
     GOOS=ios GOARCH=arm64 CGO_ENABLED=1 \
-    gomobile bind -iosversion=13.0 \
+    $GOMOBILE_BIN bind -iosversion=13.0 \
         -tags="$BUILD_TAGS" \
         -target=iossimulator/arm64 \
         -o "$ios_sim_framework/${FRAMEWORK_NAME}_ios_simulator.xcframework" \
@@ -396,7 +515,7 @@ build_unified() {
     # Build macOS arm64
     echo_info "  - Building for macOS/arm64..."
     GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 \
-    gomobile bind -iosversion=13.0 \
+    $GOMOBILE_BIN bind -iosversion=13.0 \
         -tags="$BUILD_TAGS" \
         -target=macos/arm64 \
         -o "$macos_arm64_framework/${FRAMEWORK_NAME}_macos_arm64.xcframework" \
@@ -406,10 +525,40 @@ build_unified() {
     # Build macOS amd64
     echo_info "  - Building for macOS/amd64..."
     GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 \
-    gomobile bind -iosversion=13.0 \
+    $GOMOBILE_BIN bind -iosversion=13.0 \
         -tags="$BUILD_TAGS" \
         -target=macos/amd64 \
         -o "$macos_amd64_framework/${FRAMEWORK_NAME}_macos_amd64.xcframework" \
+        -ldflags='-s -w' \
+        "$PACKAGE"
+
+    # Build tvOS arm64
+    echo_info "  - Building for tvOS/arm64..."
+    GOOS=ios GOARCH=arm64 CGO_ENABLED=1 \
+    $GOMOBILE_BIN bind -tvosversion=17.0 \
+        -tags="$BUILD_TAGS" \
+        -target=tvos/arm64 \
+        -o "$tvos_arm64_framework/${FRAMEWORK_NAME}_tvos_arm64.xcframework" \
+        -ldflags='-s -w' \
+        "$PACKAGE"
+
+    # Build tvOS simulator arm64
+    echo_info "  - Building for tvOS simulator/arm64..."
+    GOOS=ios GOARCH=arm64 CGO_ENABLED=1 \
+    $GOMOBILE_BIN bind -tvosversion=17.0 \
+        -tags="$BUILD_TAGS" \
+        -target=tvossimulator/arm64 \
+        -o "$tvos_sim_arm64_framework/${FRAMEWORK_NAME}_tvos_sim_arm64.xcframework" \
+        -ldflags='-s -w' \
+        "$PACKAGE"
+
+    # Build tvOS simulator amd64
+    echo_info "  - Building for tvOS simulator/amd64..."
+    GOOS=ios GOARCH=amd64 CGO_ENABLED=1 \
+    $GOMOBILE_BIN bind -tvosversion=17.0 \
+        -tags="$BUILD_TAGS" \
+        -target=tvossimulator/amd64 \
+        -o "$tvos_sim_amd64_framework/${FRAMEWORK_NAME}_tvos_sim_amd64.xcframework" \
         -ldflags='-s -w' \
         "$PACKAGE"
     
@@ -427,7 +576,7 @@ build_unified() {
     cp -R "$ios_sim_framework/${FRAMEWORK_NAME}_ios_simulator.xcframework/ios-arm64-simulator" \
         "$unified_path/ios-arm64-simulator"
 
-    # Normalize framework/module names so Swift uses `import Mate` on all iOS/macOS slices.
+    # Normalize framework/module names so Swift uses `import Mate` on all iOS/macOS/tvOS slices.
     normalize_ios_framework_slice "$unified_path/ios-arm64"
     normalize_ios_framework_slice "$unified_path/ios-arm64-simulator"
     
@@ -457,6 +606,23 @@ build_unified() {
     cd - > /dev/null
 
     normalize_macos_framework_slice "$unified_path/macos-arm64_x86_64"
+
+    # Copy tvOS architectures
+    echo_info "  - Adding tvOS architectures..."
+    cp -R "$tvos_arm64_framework/${FRAMEWORK_NAME}_tvos_arm64.xcframework/tvos-arm64" \
+        "$unified_path/tvos-arm64"
+    normalize_ios_framework_slice "$unified_path/tvos-arm64"
+
+    mkdir -p "$unified_path/tvos-arm64_x86_64-simulator"
+    cp -R "$tvos_sim_arm64_framework/${FRAMEWORK_NAME}_tvos_sim_arm64.xcframework/tvos-arm64-simulator/${FRAMEWORK_NAME}_tvos_sim_arm64.framework" \
+        "$unified_path/tvos-arm64_x86_64-simulator/${FRAMEWORK_NAME}.framework"
+
+    lipo -create \
+        "$tvos_sim_arm64_framework/${FRAMEWORK_NAME}_tvos_sim_arm64.xcframework/tvos-arm64-simulator/${FRAMEWORK_NAME}_tvos_sim_arm64.framework/${FRAMEWORK_NAME}_tvos_sim_arm64" \
+        "$tvos_sim_amd64_framework/${FRAMEWORK_NAME}_tvos_sim_amd64.xcframework/tvos-x86_64-simulator/${FRAMEWORK_NAME}_tvos_sim_amd64.framework/${FRAMEWORK_NAME}_tvos_sim_amd64" \
+        -output "$unified_path/tvos-arm64_x86_64-simulator/${FRAMEWORK_NAME}.framework/${FRAMEWORK_NAME}"
+
+    normalize_ios_framework_slice "$unified_path/tvos-arm64_x86_64-simulator"
     
     echo_info "Step 3: Creating unified Info.plist..."
     
@@ -513,6 +679,37 @@ build_unified() {
             <key>SupportedPlatform</key>
             <string>macos</string>
         </dict>
+        <dict>
+            <key>BinaryPath</key>
+            <string>Mate.framework/Mate</string>
+            <key>LibraryIdentifier</key>
+            <string>tvos-arm64</string>
+            <key>LibraryPath</key>
+            <string>Mate.framework</string>
+            <key>SupportedArchitectures</key>
+            <array>
+                <string>arm64</string>
+            </array>
+            <key>SupportedPlatform</key>
+            <string>tvos</string>
+        </dict>
+        <dict>
+            <key>BinaryPath</key>
+            <string>Mate.framework/Mate</string>
+            <key>LibraryIdentifier</key>
+            <string>tvos-arm64_x86_64-simulator</string>
+            <key>LibraryPath</key>
+            <string>Mate.framework</string>
+            <key>SupportedArchitectures</key>
+            <array>
+                <string>arm64</string>
+                <string>x86_64</string>
+            </array>
+            <key>SupportedPlatform</key>
+            <string>tvos</string>
+            <key>SupportedPlatformVariant</key>
+            <string>simulator</string>
+        </dict>
     </array>
     <key>CFBundlePackageType</key>
     <string>XFWK</string>
@@ -531,6 +728,7 @@ EOF
     echo_info "   Supported platforms:"
     echo_info "   - iOS (arm64 device + arm64 simulator)"
     echo_info "   - macOS (arm64 + x86_64)"
+    echo_info "   - tvOS (arm64 device + arm64/x86_64 simulator)"
 }
 
 # Main build logic
@@ -541,21 +739,26 @@ case "$BUILD_TYPE" in
     macos)
         build_macos
         ;;
+    tvos)
+        build_tvos
+        ;;
     all)
         build_ios
         build_macos
+        build_tvos
         ;;
     unified)
         build_unified
         ;;
     *)
         echo_error "Unknown build type: $BUILD_TYPE"
-        echo "Usage: $0 [ios|macos|all|unified]"
+        echo "Usage: $0 [ios|macos|tvos|all|unified]"
         echo ""
         echo "Options:"
         echo "  ios      - Build iOS framework only"
         echo "  macos    - Build macOS framework only"
-        echo "  all      - Build separate iOS and macOS frameworks"
+        echo "  tvos     - Build tvOS framework only"
+        echo "  all      - Build separate iOS, macOS, and tvOS frameworks"
         echo "  unified  - Build single XCFramework with all platforms (recommended)"
         exit 1
         ;;
