@@ -28,7 +28,7 @@ require (
 	github.com/metacubex/jls-tls v0.0.0-20260723084315-67adc0e2f796
 	github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604
 	github.com/metacubex/mhurl v0.1.0
-	github.com/metacubex/mipstack v0.0.0-20260816065001-b7038299fe13
+	github.com/metacubex/mipstack v0.0.0-20260910230046-ba762df4c91d
 	github.com/metacubex/mlkem v0.1.0
 	github.com/metacubex/quic-go v0.61.1-0.20260727080200-2548683b76f4
 	github.com/metacubex/randv2 v0.2.0
@@ -181,6 +181,6 @@ replace google.golang.org/protobuf => github.com/metacubex/protobuf-go v0.0.0-20
 
 replace github.com/WarrDoge/sslcon => ./transport/openconnect/sslcon
 
-replace github.com/playstonex/sing-tun => ../../../sing-tun
+replace github.com/playstonex/sing-tun => ../sing-tun
 
 tool golang.org/x/mobile/cmd/gobind
