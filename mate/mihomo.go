@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	runtimeDebug "runtime/debug"
 	"syscall"
 	"time"
 
@@ -33,11 +34,37 @@ type ServerConfig struct {
 	CacheDir   string
 	LogDir     string
 	ErroDir    string
+	// DebugGOMAXPROCS overrides runtime.GOMAXPROCS for this process when > 0.
+	// 0 (the gomobile zero value, indistinguishable from "unset") leaves the
+	// platform default from mate/service.go's init() untouched. Debug-only:
+	// production callers should not set this.
+	DebugGOMAXPROCS int
+	// DebugGCPercent overrides runtime/debug.SetGCPercent for this process
+	// when > 0. 0 leaves init()'s platform default untouched; -1 is a valid
+	// Go GC-percent value (disables percentage-based GC) but cannot be
+	// distinguished from "unset" through this int, so route -1 through a
+	// dedicated toggle later if that value is ever needed. Debug-only.
+	DebugGCPercent int
 }
 
 func Start(config *ServerConfig, platformInterface PlatformInterface) error {
 	var err error
 	fmt.Fprintf(os.Stderr, "[mate] Start: configPath=%s homeDir=%s\n", config.ConfigPath, config.HomeDir)
+
+	// Debug-only overrides of the platform defaults init() (mate/service.go)
+	// already applied at process load. Applying them again here is safe --
+	// runtime.GOMAXPROCS and debug.SetGCPercent are just setters, not
+	// one-shot bootstrap -- and this is the earliest point Swift can reach
+	// after the process is already running, since init() fires before any
+	// gomobile-exported function, including this one, can be called.
+	if config.DebugGOMAXPROCS > 0 {
+		previous := runtime.GOMAXPROCS(config.DebugGOMAXPROCS)
+		fmt.Fprintf(os.Stderr, "[mate] debug override: GOMAXPROCS %d -> %d\n", previous, config.DebugGOMAXPROCS)
+	}
+	if config.DebugGCPercent > 0 {
+		previous := runtimeDebug.SetGCPercent(config.DebugGCPercent)
+		fmt.Fprintf(os.Stderr, "[mate] debug override: GCPercent %d -> %d\n", previous, config.DebugGCPercent)
+	}
 
 	globalPlatformInterface = platformInterface
 
