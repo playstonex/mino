@@ -21,6 +21,7 @@ type TunOption struct {
 	MTU                                   uint32         `inbound:"mtu,omitempty"`
 	GSO                                   bool           `inbound:"gso,omitempty"`
 	GSOMaxSize                            uint32         `inbound:"gso-max-size,omitempty"`
+	TCPWindowBytes                        int            `inbound:"tcp-window-bytes,omitempty"`
 	Inet4Address                          []netip.Prefix `inbound:"inet4-address,omitempty"`
 	Inet6Address                          []netip.Prefix `inbound:"inet6-address,omitempty"`
 	IPRoute2TableIndex                    int            `inbound:"iproute2-table-index,omitempty"`
@@ -99,6 +100,7 @@ func NewTun(options *TunOption) (*Tun, error) {
 			MTU:                                   options.MTU,
 			GSO:                                   options.GSO,
 			GSOMaxSize:                            options.GSOMaxSize,
+			TCPWindowBytes:                        options.TCPWindowBytes,
 			Inet4Address:                          options.Inet4Address,
 			Inet6Address:                          options.Inet6Address,
 			IPRoute2TableIndex:                    options.IPRoute2TableIndex,

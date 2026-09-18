@@ -505,6 +505,7 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 		InterfaceFinder:        interfaceFinder,
 		EnforceBindInterface:   EnforceBindInterface,
 		PacketInterceptor:      C.GetTunPacketInterceptor(),
+		TCPWindowBytes:         options.TCPWindowBytes,
 	}
 	l.tunIf = tunIf
 

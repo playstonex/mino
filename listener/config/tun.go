@@ -20,6 +20,13 @@ type Tun struct {
 	MTU                                   uint32         `yaml:"mtu" json:"mtu,omitempty"`
 	GSO                                   bool           `yaml:"gso" json:"gso,omitempty"`
 	GSOMaxSize                            uint32         `yaml:"gso-max-size" json:"gso-max-size,omitempty"`
+	// TCPWindowBytes overrides the gVisor stack's fixed 20KB TCP receive/send
+	// buffer ceiling. 0 (the default) keeps sing-tun's built-in 20*1024.
+	// Only takes effect on the gvisor stack -- see
+	// docs/TUN_STACK_OPTIMIZATION.md step 3/4 in the Violet app repo for the
+	// throughput-bound arithmetic (throughput ≈ window / RTT) behind why
+	// this exists.
+	TCPWindowBytes                        int            `yaml:"tcp-window-bytes" json:"tcp-window-bytes,omitempty"`
 	Inet4Address                          []netip.Prefix `yaml:"inet4-address" json:"inet4-address,omitempty"`
 	Inet6Address                          []netip.Prefix `yaml:"inet6-address" json:"inet6-address,omitempty"`
 	IPRoute2TableIndex                    int            `yaml:"iproute2-table-index" json:"iproute2-table-index,omitempty"`
@@ -119,6 +126,9 @@ func (t *Tun) Equal(other Tun) bool {
 		return false
 	}
 	if t.GSOMaxSize != other.GSOMaxSize {
+		return false
+	}
+	if t.TCPWindowBytes != other.TCPWindowBytes {
 		return false
 	}
 	if !slices.Equal(t.Inet4Address, other.Inet4Address) {
