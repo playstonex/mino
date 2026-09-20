@@ -39,6 +39,49 @@ import (
 var InterfaceName = "Meta"
 var EnforceBindInterface = false
 
+// iOSMaxTCPWindowBytes bounds tun.tcp-window-bytes on iOS. gVisor's
+// TCPReceiveBufferSizeRangeOption/TCPSendBufferSizeRangeOption (stack_gvisor.go)
+// set Default==Max GLOBALLY for every TCP connection on the stack, not per
+// socket -- so total buffer footprint scales with window * 2 (send+receive) *
+// concurrent connections. mate/service.go caps the Go heap at 40MB out of the
+// iOS Network Extension's ~50MB hard ceiling, leaving roughly 10MB for
+// gVisor's own segment queues, cgo/runtime overhead and everything else non-Go.
+// Reproduced 2026-09-20 on a real device: window=131072 (128KB) under a
+// saturating speedtest reached 127 active connections and the NE process
+// went unresponsive/disconnected with no clean stopTunnel and no crash report
+// -- consistent with the 40MB soft limit forcing GC hard enough, or the
+// non-Go headroom, to starve the process rather than fail a single allocation.
+// 32768 (32KB) keeps worst case (32KB * 2 * 150 conns ~= 9.4MB) inside that
+// headroom with margin, while still raising the 20KB stock ceiling somewhat.
+const iOSMaxTCPWindowBytes = 32 * 1024
+
+// clampTCPWindowBytesForGOOS is the pure, platform-parameterized policy:
+// separated from clampTCPWindowBytes so it can be unit tested on any build
+// host without needing to actually run on iOS (runtime.GOOS is fixed at
+// compile time on the machine running `go test`).
+func clampTCPWindowBytesForGOOS(goos string, v int) int {
+	if v <= 0 {
+		return v
+	}
+	if goos == "ios" && v > iOSMaxTCPWindowBytes {
+		log.Warnln("[TUN] tcp-window-bytes %d exceeds the iOS safety ceiling (%d); clamping. "+
+			"gVisor's TCP window option applies to every concurrent connection, and a high value "+
+			"under sustained multi-connection throughput can exhaust the Network Extension's ~50MB "+
+			"memory budget (see docs/TUN_STACK_OPTIMIZATION.md step 3 clamp note).", v, iOSMaxTCPWindowBytes)
+		return iOSMaxTCPWindowBytes
+	}
+	return v
+}
+
+// clampTCPWindowBytes enforces the platform-appropriate ceiling on
+// tun.tcp-window-bytes. A caller value of 0 is left untouched (it means
+// "use sing-tun's built-in 20KB default", which is already well under any
+// platform's headroom). Values above the ceiling are lowered, not rejected,
+// so a debug build derived from a desktop config still starts.
+func clampTCPWindowBytes(v int) int {
+	return clampTCPWindowBytesForGOOS(runtime.GOOS, v)
+}
+
 type Listener struct {
 	closed  bool
 	options LC.Tun
@@ -505,7 +548,7 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 		InterfaceFinder:        interfaceFinder,
 		EnforceBindInterface:   EnforceBindInterface,
 		PacketInterceptor:      C.GetTunPacketInterceptor(),
-		TCPWindowBytes:         options.TCPWindowBytes,
+		TCPWindowBytes:         clampTCPWindowBytes(options.TCPWindowBytes),
 	}
 	l.tunIf = tunIf
 
