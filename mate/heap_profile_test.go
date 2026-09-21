@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -22,6 +23,33 @@ func decodeProfileResult(t *testing.T, raw string) heapProfileResult {
 		t.Fatalf("undecodable JSON: %v (%s)", err, raw)
 	}
 	return result
+}
+
+// The rate is what decides whether a profile can be read at all: at the 512 KB
+// default, an infrequent site is one sample reported AT the quantum, which is
+// how a dozen ~512 kB entries in the first profile were mistaken for half a
+// megabyte each.
+func TestSetMemProfileRateReportsThePreviousValue(t *testing.T) {
+	original := runtime.MemProfileRate
+	t.Cleanup(func() { runtime.MemProfileRate = original })
+
+	previous := SetMemProfileRate(64 * 1024)
+	if previous != original {
+		t.Errorf("returned previous = %d, want %d", previous, original)
+	}
+	if runtime.MemProfileRate != 64*1024 {
+		t.Errorf("MemProfileRate = %d, want %d", runtime.MemProfileRate, 64*1024)
+	}
+
+	// A non-positive rate must be ignored rather than applied: 0 DISABLES
+	// profiling entirely, so treating it as a value would silently turn the
+	// instrument off while looking like a configuration change.
+	if got := SetMemProfileRate(0); got != 64*1024 {
+		t.Errorf("returned previous = %d after a no-op, want %d", got, 64*1024)
+	}
+	if runtime.MemProfileRate != 64*1024 {
+		t.Errorf("MemProfileRate = %d after passing 0; profiling would be off", runtime.MemProfileRate)
+	}
 }
 
 func TestWriteHeapProfileProducesAParseableProfile(t *testing.T) {

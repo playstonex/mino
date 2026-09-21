@@ -26,6 +26,33 @@ type heapProfileResult struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// SetMemProfileRate raises heap-profile resolution, and exists because the
+// default cost a round of this investigation.
+//
+// `runtime.MemProfileRate` defaults to 512 KB: one sample per 512 KB allocated.
+// On a 12-25 MB heap that is roughly 25-50 samples for the WHOLE process, so
+// every infrequent allocation site shows up as exactly one sample -- and a
+// single sample is reported at the quantum, ~512 KB. The first profile taken
+// here listed a dozen sites at 512.0x kB and they were read as half a megabyte
+// each; they were one sample each and could have been a few hundred bytes. Only
+// the multi-sample sites (sync.Pool at 4.6 MB, the copy path at 3.1 MB) carried
+// real signal.
+//
+// Returns the previous rate so a caller can report what changed rather than
+// assume it took effect.
+//
+// The cost is why this is not simply lowered at init: the rate applies to EVERY
+// allocation in the process, and this one is already memory-constrained. It is
+// wired to the user's diagnostic-logging toggle, so the resolution is paid for
+// only while someone is actually diagnosing.
+func SetMemProfileRate(bytesPerSample int) int {
+	previous := runtime.MemProfileRate
+	if bytesPerSample > 0 {
+		runtime.MemProfileRate = bytesPerSample
+	}
+	return previous
+}
+
 // WriteHeapProfileJSON writes a pprof heap profile to path and reports where it
 // went and how big it is.
 //
