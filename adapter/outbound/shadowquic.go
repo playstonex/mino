@@ -3,6 +3,7 @@ package outbound
 import (
 	"context"
 	"net"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -155,6 +156,14 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
 	if option.ReceiveWindow == 0 {
 		quicConfig.InitialConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow / 10
 		quicConfig.MaxConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow
+	}
+	// shadowquic's config is jls-quic-go's *Config, a different type from
+	// quic-go's, so applyPlatformQUICWindowCeiling (typed to quic.Config) cannot
+	// take it. The field names and uint64 types match, so apply the same cap
+	// inline via the shared helpers. Same policy and reasoning as tuic.
+	if isMemoryCappedGOOS(runtime.GOOS) {
+		quicConfig.MaxConnectionReceiveWindow = capWindow(quicConfig.MaxConnectionReceiveWindow, mobileMaxConnectionReceiveWindow)
+		quicConfig.MaxStreamReceiveWindow = capWindow(quicConfig.MaxStreamReceiveWindow, mobileMaxStreamReceiveWindow)
 	}
 
 	outbound := &ShadowQuic{

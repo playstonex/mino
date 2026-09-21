@@ -43,10 +43,11 @@ const (
 // hard process memory budget, leaving every other platform on quic-go's
 // defaults.
 //
-// An explicitly configured window is always honoured, including one larger than
-// the ceiling: the user asking for a specific window is a deliberate act, and
-// silently overriding it would make the config lie about what is in force. Only
-// the unset case -- where the alternative is quic-go's 15 MB -- is filled in.
+// An explicitly configured window BELOW the ceiling is honoured (a deliberate
+// choice to use even less memory). A window above it -- whether unset (so
+// quic-go's 15MB / tuic's 64MB default applies) or explicitly set too large --
+// is capped: inside a ~50MB budget an over-large window is not a preference to
+// respect, it is a config that gets the tunnel killed.
 func applyPlatformQUICWindowCeiling(config *quic.Config) {
 	applyQUICWindowCeilingForGOOS(config, runtime.GOOS)
 }
@@ -54,16 +55,31 @@ func applyPlatformQUICWindowCeiling(config *quic.Config) {
 // applyQUICWindowCeilingForGOOS is the testable form. runtime.GOOS is a
 // compile-time constant, so the iOS branch is unreachable from a test running on
 // any other platform unless the target is a parameter.
+//
+// On a memory-capped platform this is a true CAP, not a fill: it lowers a
+// window that is unset (0 -> quic-go's 15MB), set to a large tuic default
+// (64MB), OR explicitly configured above the ceiling. The earlier "honour an
+// explicit larger value" contract was wrong for this platform class — an
+// explicit 64MB window is not a preference to respect inside a ~50MB budget,
+// it is a config that gets the tunnel SIGKILLed. Callers that fill their own
+// defaults (tuic, shadowquic set 64MB before calling here) therefore still get
+// bounded, where a fill-only version would see a non-zero value and no-op.
+// A value 0 < w <= ceiling is left alone.
 func applyQUICWindowCeilingForGOOS(config *quic.Config, goos string) {
 	if !isMemoryCappedGOOS(goos) {
 		return
 	}
-	if config.MaxConnectionReceiveWindow == 0 {
-		config.MaxConnectionReceiveWindow = mobileMaxConnectionReceiveWindow
+	config.MaxConnectionReceiveWindow = capWindow(config.MaxConnectionReceiveWindow, mobileMaxConnectionReceiveWindow)
+	config.MaxStreamReceiveWindow = capWindow(config.MaxStreamReceiveWindow, mobileMaxStreamReceiveWindow)
+}
+
+// capWindow returns the ceiling when the current value is unset (0) or exceeds
+// it, and otherwise leaves a smaller explicit value untouched.
+func capWindow(current, ceiling uint64) uint64 {
+	if current == 0 || current > ceiling {
+		return ceiling
 	}
-	if config.MaxStreamReceiveWindow == 0 {
-		config.MaxStreamReceiveWindow = mobileMaxStreamReceiveWindow
-	}
+	return current
 }
 
 // isMemoryCappedGOOS reports whether the platform's process budget is small

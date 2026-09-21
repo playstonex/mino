@@ -259,7 +259,11 @@ func NewBBRSender(
 }
 
 func (b *bbrSender) maxCongestionWindow() congestion.ByteCount {
-	return b.maxDatagramSize * DefaultBBRMaxCongestionWindow
+	// Reads the ceiling, NOT the raw DefaultBBRMaxCongestionWindow constant.
+	// This method is the authoritative growth bound (line ~856 clamps
+	// congestionWindow to it), so this is the one place the cap must land for
+	// bbr_meta_v1. See cwnd_ceiling.go.
+	return cappedMaxCongestionWindow(DefaultBBRMaxCongestionWindow, b.maxDatagramSize)
 }
 
 func (b *bbrSender) minCongestionWindow() congestion.ByteCount {

@@ -216,6 +216,13 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 		quicConfig.InitialConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow / 10
 		quicConfig.MaxConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow
 	}
+	// Cap the receive windows on memory-budgeted platforms. tuic's defaults
+	// (64MB connection / 15MB stream) are even larger than quic-go's own, and
+	// on iOS a single saturating transfer can grow them to the ceiling inside a
+	// ~50MB Network Extension budget. Same policy as hysteria2: caps an unset
+	// or over-large window, leaves a smaller explicit one. See
+	// quic_window_ceiling.go.
+	applyPlatformQUICWindowCeiling(quicConfig)
 
 	if len(option.Ip) > 0 {
 		addr = net.JoinHostPort(option.Ip, strconv.Itoa(option.Port))

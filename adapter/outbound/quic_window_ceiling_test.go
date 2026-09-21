@@ -36,10 +36,10 @@ func TestQUICWindowCeilingLeavesOtherPlatformsOnDefaults(t *testing.T) {
 	}
 }
 
-func TestQUICWindowCeilingHonoursExplicitConfig(t *testing.T) {
-	// Deliberately ABOVE the ceiling: a user asking for a big window has made a
-	// decision, and quietly shrinking it would make the config describe
-	// something that is not in force.
+func TestQUICWindowCeilingCapsExplicitLargerConfig(t *testing.T) {
+	// Deliberately ABOVE the ceiling. On a hard-memory-budget platform this is
+	// NOT honoured: a 32MB window inside a ~50MB Network Extension is a config
+	// that gets the tunnel SIGKILLed, so the cap lowers it to the ceiling.
 	const requestedConn = 32 * 1024 * 1024
 	const requestedStream = 16 * 1024 * 1024
 
@@ -49,30 +49,53 @@ func TestQUICWindowCeilingHonoursExplicitConfig(t *testing.T) {
 	}
 	applyQUICWindowCeilingForGOOS(config, "ios")
 
+	if config.MaxConnectionReceiveWindow != mobileMaxConnectionReceiveWindow {
+		t.Errorf("MaxConnectionReceiveWindow = %d, want it capped to %d",
+			config.MaxConnectionReceiveWindow, uint64(mobileMaxConnectionReceiveWindow))
+	}
+	if config.MaxStreamReceiveWindow != mobileMaxStreamReceiveWindow {
+		t.Errorf("MaxStreamReceiveWindow = %d, want it capped to %d",
+			config.MaxStreamReceiveWindow, uint64(mobileMaxStreamReceiveWindow))
+	}
+}
+
+// A window explicitly set BELOW the ceiling is a genuine preference to reduce
+// memory further, and must be left alone.
+func TestQUICWindowCeilingHonoursSmallerExplicitConfig(t *testing.T) {
+	const requestedConn = 1 * 1024 * 1024  // below the 4MB ceiling
+	const requestedStream = 512 * 1024     // below the 2MB ceiling
+
+	config := &quic.Config{
+		MaxConnectionReceiveWindow: requestedConn,
+		MaxStreamReceiveWindow:     requestedStream,
+	}
+	applyQUICWindowCeilingForGOOS(config, "ios")
+
 	if config.MaxConnectionReceiveWindow != requestedConn {
-		t.Errorf("MaxConnectionReceiveWindow = %d, want the configured %d",
+		t.Errorf("MaxConnectionReceiveWindow = %d, want the smaller configured %d",
 			config.MaxConnectionReceiveWindow, uint64(requestedConn))
 	}
 	if config.MaxStreamReceiveWindow != requestedStream {
-		t.Errorf("MaxStreamReceiveWindow = %d, want the configured %d",
+		t.Errorf("MaxStreamReceiveWindow = %d, want the smaller configured %d",
 			config.MaxStreamReceiveWindow, uint64(requestedStream))
 	}
 }
 
 // A partially configured pair is the realistic mistake: one field set, the other
-// forgotten. The forgotten one must still be bounded.
-func TestQUICWindowCeilingFillsOnlyTheMissingHalf(t *testing.T) {
-	const requestedStream = 8 * 1024 * 1024
+// forgotten. The forgotten one must still be bounded, and a set-but-small one
+// honoured.
+func TestQUICWindowCeilingCapsTheUnsetHalf(t *testing.T) {
+	const requestedStream = 1 * 1024 * 1024 // below the 2MB stream ceiling
 
 	config := &quic.Config{MaxStreamReceiveWindow: requestedStream}
 	applyQUICWindowCeilingForGOOS(config, "ios")
 
 	if config.MaxStreamReceiveWindow != requestedStream {
-		t.Errorf("MaxStreamReceiveWindow = %d, want the configured %d",
+		t.Errorf("MaxStreamReceiveWindow = %d, want the smaller configured %d",
 			config.MaxStreamReceiveWindow, uint64(requestedStream))
 	}
 	if config.MaxConnectionReceiveWindow != mobileMaxConnectionReceiveWindow {
-		t.Errorf("MaxConnectionReceiveWindow = %d, want the ceiling %d",
+		t.Errorf("MaxConnectionReceiveWindow = %d, want the unset half capped to %d",
 			config.MaxConnectionReceiveWindow, uint64(mobileMaxConnectionReceiveWindow))
 	}
 }

@@ -67,7 +67,9 @@ func NewCubicSender(
 		reno,
 		initialMaxDatagramSize,
 		initialCongestionWindow*initialMaxDatagramSize,
-		MaxCongestionWindowPackets*initialMaxDatagramSize,
+		// On iOS this collapses MaxCongestionWindowPackets (20000) to the
+		// 2048-packet ceiling; elsewhere it is unchanged. See cwnd_ceiling.go.
+		cappedMaxCongestionWindow(MaxCongestionWindowPackets, initialMaxDatagramSize),
 	)
 }
 
@@ -107,7 +109,12 @@ func (c *cubicSender) HasPacingBudget(now monotime.Time) bool {
 }
 
 func (c *cubicSender) maxCongestionWindow() congestion.ByteCount {
-	return c.maxDatagramSize * MaxCongestionWindowPackets
+	// Reads the ceiling, NOT the raw MaxCongestionWindowPackets constant. This
+	// method is the authoritative growth bound (initialMaxCongestionWindow set
+	// in the constructor is only the starting max), so clamping only the
+	// constructor would be a dead change — growth would still climb back to
+	// 20000 packets here. See cwnd_ceiling.go.
+	return cappedMaxCongestionWindow(MaxCongestionWindowPackets, c.maxDatagramSize)
 }
 
 func (c *cubicSender) minCongestionWindow() congestion.ByteCount {

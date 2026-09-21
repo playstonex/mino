@@ -214,6 +214,10 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 		InitialPacketSize: 1242,
 		KeepAlivePeriod:   30 * time.Second,
 	}
+	// masque leaves MaxConnection/StreamReceiveWindow unset, so without this it
+	// inherits quic-go's 15MB connection default; bound it on iOS. See
+	// quic_window_ceiling.go.
+	applyPlatformQUICWindowCeiling(outbound.quicConfig)
 
 	outbound.option = option
 
