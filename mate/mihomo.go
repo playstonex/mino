@@ -63,6 +63,11 @@ func Start(config *ServerConfig, platformInterface PlatformInterface) error {
 	}
 	if config.DebugGCPercent > 0 {
 		previous := runtimeDebug.SetGCPercent(config.DebugGCPercent)
+		// Keep the value GetRuntimeStatsJSON reports in step with what is
+		// actually in force, or the stats would still claim init()'s default
+		// and an A/B run against this knob would be read against the wrong
+		// baseline.
+		recordRuntimeLimits(effectiveMemoryLimit.Load(), config.DebugGCPercent)
 		fmt.Fprintf(os.Stderr, "[mate] debug override: GCPercent %d -> %d\n", previous, config.DebugGCPercent)
 	}
 

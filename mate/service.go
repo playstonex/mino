@@ -23,21 +23,56 @@ func init() {
 	case "ios":
 		// iOS Network Extension memory limit is ~50 MB (iOS 15+).
 		// Reserve headroom for C/ObjC/stack — cap Go heap at 40 MB.
-		runtimeDebug.SetMemoryLimit(40 * 1024 * 1024)
+		const iosMemLimit = 40 * 1024 * 1024
+		runtimeDebug.SetMemoryLimit(iosMemLimit)
 		// Network Extension has limited CPU budget.
 		runtime.GOMAXPROCS(3)
-		// More aggressive GC to stay within memory budget.
-		runtimeDebug.SetGCPercent(50)
+		// 100, not 50, and the reasoning matters because this was 50 and the
+		// process livelocked.
+		//
+		// SetMemoryLimit is a SOFT limit: breaching it does not fail an
+		// allocation, it makes the collector run harder and harder to get back
+		// under, up to the runtime's 50%-of-CPU GC limiter. On a tunnel with
+		// GOMAXPROCS(3) on efficiency cores that presents as the extension
+		// being unable to move packets — unresponsive, not crashed.
+		//
+		// That is what was captured on 2026-09-21: an Xcode thread dump taken
+		// while the tunnel was down under a saturating speedtest showed two GC
+		// mark workers draining concurrently at a 48.4 MB footprint, with NO
+		// crash report and NO JetsamEvent. No Jetsam kill means the footprint
+		// was survivable and CPU was the binding constraint, not RSS.
+		//
+		// The 40 MB limit above already guarantees the ceiling on its own — as
+		// the heap approaches it the runtime collects earlier regardless of
+		// this value. So GOGC's only remaining job is steady-state pacing, and
+		// 50 was paying extra GC CPU for a bound the memory limit already
+		// enforces. 100 trades a little idle heap footprint for materially
+		// less GC CPU, which is the axis that actually failed.
+		//
+		// Changed ALONE, on purpose: the 40 MB limit is left exactly as it was
+		// so the next device run measures one variable. Picking a new limit
+		// needs the live-heap number from GetRuntimeStatsJSON
+		// (mate/runtime_stats.go), which did not exist before this change —
+		// the old value could only have been guessed at.
+		const iosGCPercent = 100
+		runtimeDebug.SetGCPercent(iosGCPercent)
+		recordRuntimeLimits(iosMemLimit, iosGCPercent)
 
 	case "darwin":
 		// macOS has no meaningful memory constraint for Network Extension.
 		// Leave defaults (no memory limit, GOMAXPROCS = NumCPU, GCPercent = 100).
+		// Recorded as 0/100 so GetRuntimeStatsJSON reports "unlimited" rather
+		// than an invented number.
+		recordRuntimeLimits(0, 100)
 
 	default:
 		// Conservative defaults for unknown platforms.
-		runtimeDebug.SetMemoryLimit(40 * 1024 * 1024)
+		const defaultMemLimit = 40 * 1024 * 1024
+		const defaultGCPercent = 50
+		runtimeDebug.SetMemoryLimit(defaultMemLimit)
 		runtime.GOMAXPROCS(3)
-		runtimeDebug.SetGCPercent(50)
+		runtimeDebug.SetGCPercent(defaultGCPercent)
+		recordRuntimeLimits(defaultMemLimit, defaultGCPercent)
 	}
 }
 
