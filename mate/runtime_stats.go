@@ -6,6 +6,8 @@ import (
 	runtimeDebug "runtime/debug"
 	"runtime/metrics"
 	"sync/atomic"
+
+	"github.com/metacubex/mihomo/common/pool"
 )
 
 // The Go runtime knobs init() (service.go) installs are recorded here because
@@ -67,6 +69,18 @@ type runtimeStats struct {
 	// blocks goroutines raises the stack footprint without raising the live
 	// heap, which would otherwise look like "memory is fine".
 	Goroutines uint64 `json:"goroutines"`
+	// RelayBufferBytes is the per-direction TCP copy buffer in force, which is
+	// build-tag dependent (32 KB normally, 16 KB under with_low_memory).
+	//
+	// Reported because it is the term that multiplies by concurrent connection
+	// count, and because the tag was silently absent from the xcframework build
+	// for as long as it mattered: the build script passed only with_gvisor
+	// while the iOS extension was being killed for memory. A number that is
+	// only correct when someone remembers a build flag belongs in the log, not
+	// in a comment.
+	RelayBufferBytes int `json:"relayBufferBytes"`
+	// UDPBufferBytes is the same for UDP (16 KB normally, 8 KB low-memory).
+	UDPBufferBytes int `json:"udpBufferBytes"`
 }
 
 // GetRuntimeStatsJSON reports Go runtime memory and GC state as JSON.
@@ -97,6 +111,11 @@ func GetRuntimeStatsJSON() string {
 		GOMAXPROCS:    runtime.GOMAXPROCS(0),
 		ReleasedBytes: uint64Value(samples[4]),
 		Goroutines:    uint64Value(samples[5]),
+		// Read from the package, not restated as a literal: the point is to
+		// report what this binary was COMPILED with, and a literal here would
+		// keep saying the right thing after the build tag stopped being passed.
+		RelayBufferBytes: pool.RelayBufferSize,
+		UDPBufferBytes:   pool.UDPBufferSize,
 	}
 
 	encoded, err := json.Marshal(stats)

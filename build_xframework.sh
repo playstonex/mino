@@ -12,7 +12,24 @@ OUTPUT_DIR="./build/xframework"
 TEMP_DIR="./build/xframework/.temp"
 WORK_TMP_DIR=""
 GOMOBILE_CACHE_DIR="./build/gomobile"
-BUILD_TAGS="with_gvisor"
+# `with_low_memory` halves the per-connection buffers upstream sizes for hosts
+# with memory to spare: pool.RelayBufferSize 32 KB -> 16 KB, pool.UDPBufferSize
+# 16 KB -> 8 KB, and sing's buf.BufferSize 32 KB -> 16 KB. Those are exactly the
+# allocations that scale with concurrent connection count.
+#
+# It is set because the iOS Network Extension was being SIGKILLed with
+# `Terminated due to memory issue` under a speedtest, and the instrumented runs
+# showed live heap tracking goroutine count: 361 goroutines (about 180 relayed
+# connections, two copy goroutines each) against a 25.4 MB live heap, which is
+# what 180 x 2 x 32 KB plus the gVisor per-endpoint buffers comes to. An NE gets
+# roughly 50 MB for everything, so it is the case this tag exists for, and it was
+# never being passed.
+#
+# The trade-off, stated because it is real: gomobile builds every slice in one
+# invocation, so this applies to the macOS slice too, which has no memory
+# constraint and gives up a little copy throughput for nothing. That is accepted
+# because one artifact serves both and only one of them is dying.
+BUILD_TAGS="with_gvisor,with_low_memory"
 BUILD_TYPE="${1:-unified}"
 
 # Colors

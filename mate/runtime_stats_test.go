@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"runtime"
 	"testing"
+
+	"github.com/metacubex/mihomo/common/pool"
 )
 
 // The point of these tests is that a stats reader which silently returns zeros
@@ -134,6 +136,36 @@ func TestReleaseOSMemoryReturnsMappedSpansToTheOS(t *testing.T) {
 	if result.AfterBytes == result.BeforeBytes {
 		t.Errorf("mapped memory did not move (%d both sides) — the release had no effect on the figure it reports",
 			result.BeforeBytes)
+	}
+}
+
+// The build tag that halves these was absent from the xcframework build while
+// the iOS extension was being killed for memory, so the value is reported at
+// runtime rather than trusted. This asserts the report tracks the compiled-in
+// constants under whichever tag set is active, and that they stay plausible --
+// a zero would read as "no buffers" and a wrong order of magnitude would make
+// the connection-count arithmetic in the log meaningless.
+func TestBufferSizesReportWhatWasCompiledIn(t *testing.T) {
+	stats := decodeStats(t)
+
+	if stats.RelayBufferBytes != pool.RelayBufferSize {
+		t.Errorf("RelayBufferBytes = %d, want the compiled-in %d",
+			stats.RelayBufferBytes, pool.RelayBufferSize)
+	}
+	if stats.UDPBufferBytes != pool.UDPBufferSize {
+		t.Errorf("UDPBufferBytes = %d, want the compiled-in %d",
+			stats.UDPBufferBytes, pool.UDPBufferSize)
+	}
+
+	// Both variants live in 8-32 KiB. Outside that, either a constant moved or
+	// the wrong symbol is being read.
+	for name, size := range map[string]int{
+		"relay": stats.RelayBufferBytes,
+		"udp":   stats.UDPBufferBytes,
+	} {
+		if size < 8*1024 || size > 32*1024 {
+			t.Errorf("%s buffer is %d bytes, outside the 8-32 KiB both build variants use", name, size)
+		}
 	}
 }
 
