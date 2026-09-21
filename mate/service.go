@@ -21,9 +21,30 @@ import (
 func init() {
 	switch runtime.GOOS {
 	case "ios":
-		// iOS Network Extension memory limit is ~50 MB (iOS 15+).
-		// Reserve headroom for C/ObjC/stack — cap Go heap at 40 MB.
-		const iosMemLimit = 40 * 1024 * 1024
+		// 20 MB, and the number is derived rather than chosen.
+		//
+		// This was 40 MB on the reasoning that an iOS Network Extension gets
+		// ~50 MB and Go should be left most of it. Measurement showed that
+		// makes the limit UNREACHABLE: the process is killed on its
+		// phys_footprint, and footprint runs about 24 MB ahead of the live heap
+		// (measured across one kill: 18.5 vs 3.5, 22.4 vs 4.6, 32.5 vs 10.2,
+		// 47.2 vs 22.8). So the fatal heap is ~23 MB, and a limit set at 40 MB
+		// can only ever be crossed by a process that is already dead. Every run
+		// died with the limit reporting 57-65% used.
+		//
+		//	footprint <= 44 MB  =>  live heap <= 20 MB
+		//
+		// 44 MB rather than the ~50 MB ceiling because a limit that binds only
+		// at the kill line has no time to act.
+		//
+		// The trade-off is deliberate and is NOT free: a soft limit does not
+		// fail allocations, it makes the collector work harder, so a transfer
+		// that wants more than 20 MB of live heap will now see GC CPU climb and
+		// throughput fall instead of the tunnel dying. Measured GC CPU at the
+		// old cliff was already 16-19%, so expect more. That is the intended
+		// exchange -- degraded and alive beats killed and reconnecting, because
+		// a kill drops every connection while back-pressure only slows them.
+		const iosMemLimit = 20 * 1024 * 1024
 		runtimeDebug.SetMemoryLimit(iosMemLimit)
 		// Network Extension has limited CPU budget.
 		runtime.GOMAXPROCS(3)

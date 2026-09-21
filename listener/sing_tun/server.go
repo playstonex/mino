@@ -43,17 +43,29 @@ var EnforceBindInterface = false
 // TCPReceiveBufferSizeRangeOption/TCPSendBufferSizeRangeOption (stack_gvisor.go)
 // set Default==Max GLOBALLY for every TCP connection on the stack, not per
 // socket -- so total buffer footprint scales with window * 2 (send+receive) *
-// concurrent connections. mate/service.go caps the Go heap at 40MB out of the
-// iOS Network Extension's ~50MB hard ceiling, leaving roughly 10MB for
-// gVisor's own segment queues, cgo/runtime overhead and everything else non-Go.
-// Reproduced 2026-09-20 on a real device: window=131072 (128KB) under a
-// saturating speedtest reached 127 active connections and the NE process
-// went unresponsive/disconnected with no clean stopTunnel and no crash report
-// -- consistent with the 40MB soft limit forcing GC hard enough, or the
-// non-Go headroom, to starve the process rather than fail a single allocation.
-// 32768 (32KB) keeps worst case (32KB * 2 * 150 conns ~= 9.4MB) inside that
-// headroom with margin, while still raising the 20KB stock ceiling somewhat.
-const iOSMaxTCPWindowBytes = 32 * 1024
+// concurrent connections.
+//
+// 20 KB: gVisor's own stock value, and the arithmetic now rests on measurement
+// rather than the estimate it replaces. This was 32 KB, chosen from a guess of
+// "150 connections" before anything on the device could count them. Instrumented
+// runs since then have measured the real shape of a saturating speedtest: the
+// extension reached 416 goroutines (about 208 concurrent relayed connections)
+// with a 22.8 MB live heap, and was SIGKILLed at a 47.2 MB process footprint.
+//
+//	32 KB * 2 * 208 conns = 13.6 MB
+//	20 KB * 2 * 208 conns =  8.5 MB
+//
+// So the previous ceiling was spending roughly 5 MB more than stock on the one
+// term that scales with connection count, inside a budget that turned out to
+// have about 3 MB of headroom left at the moment of death. Raising the stock
+// ceiling at all was a throughput optimisation taken before the memory cost was
+// measurable; it is not affordable on this platform.
+//
+// This is a CEILING, not a default: a config asking for less still gets less.
+// And it is a mitigation, not a bound -- nothing here limits concurrent
+// connections, so a heavier load still scales past it. See
+// docs/TUN_STACK_OPTIMIZATION.md.
+const iOSMaxTCPWindowBytes = 20 * 1024
 
 // clampTCPWindowBytesForGOOS is the pure, platform-parameterized policy:
 // separated from clampTCPWindowBytes so it can be unit tested on any build
