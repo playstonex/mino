@@ -34,7 +34,19 @@ type IPInfo struct {
 	Name string `maxminddb:"name"`
 }
 
+// Available reports whether a database was actually loaded. The loaders degrade
+// to a nil reader instead of exiting the process (see mmdb.go), so every lookup
+// has to tolerate that -- without these guards the change would only trade a
+// clean exit for a nil-pointer panic, which kills the tunnel just the same.
+func (r IPReader) Available() bool {
+	return r.Reader != nil
+}
+
 func (r IPReader) LookupCode(ipAddress net.IP) []string {
+	if r.Reader == nil {
+		return []string{}
+	}
+
 	switch r.databaseType {
 	case typeMaxmind:
 		var country geoip2Country
@@ -72,7 +84,17 @@ func (r IPReader) LookupCode(ipAddress net.IP) []string {
 	}
 }
 
+func (r ASNReader) Available() bool {
+	return r.Reader != nil
+}
+
 func (r ASNReader) LookupASN(ip net.IP) (string, string) {
+	// Guarded before the switch because that switch reads r.Metadata, so a nil
+	// reader panics on the very first line rather than at the lookup.
+	if r.Reader == nil {
+		return "", ""
+	}
+
 	switch r.Metadata.DatabaseType {
 	case "GeoLite2-ASN", "DBIP-ASN-Lite (compat=GeoLite2-ASN)":
 		var result GeoLite2
