@@ -3,6 +3,7 @@ package mate
 import (
 	"encoding/json"
 	"runtime"
+	runtimeDebug "runtime/debug"
 	"runtime/metrics"
 	"sync/atomic"
 )
@@ -103,6 +104,61 @@ func GetRuntimeStatsJSON() string {
 		return "{}"
 	}
 	return string(encoded)
+}
+
+// ReleaseOSMemoryJSON forces a collection and hands unused spans back to the
+// OS, returning the mapped total before and after so the caller can log what it
+// achieved instead of assuming.
+//
+// This is the lever the soft memory limit cannot pull. iOS killed the extension
+// with `Terminated due to memory issue` while the live heap sat at 5-15 MB:
+// SetMemoryLimit is compared against live heap, so it never intervened, while
+// total MAPPED memory climbed (9.6 -> 18.7 -> 26.5 MB in 90 s) and took the
+// process footprint to the kill line with it. Under packet churn the background
+// scavenger paces itself to about 1% of CPU and simply loses that race.
+//
+// It works on this platform specifically because Go's darwin `sysUnusedOS` uses
+// MADV_FREE_REUSABLE, which -- unlike plain MADV_FREE -- propagates the
+// accounting to `task_info`. So released spans actually leave `phys_footprint`,
+// which is the number Jetsam compares against the limit. On a platform using
+// plain MADV_FREE this call would lower Go's own figures and change nothing the
+// kernel charges for.
+//
+// FreeOSMemory stops the world, so this is for a caller that has decided the
+// footprint is heading for a kill -- not for a timer.
+func ReleaseOSMemoryJSON() string {
+	before := mappedBytes()
+	runtimeDebug.FreeOSMemory()
+	after := mappedBytes()
+
+	payload := struct {
+		BeforeBytes uint64 `json:"beforeBytes"`
+		AfterBytes  uint64 `json:"afterBytes"`
+	}{BeforeBytes: before, AfterBytes: after}
+
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
+	}
+	return string(encoded)
+}
+
+// mappedBytes is total mapped minus spans already returned to the OS -- the
+// Go-side share of what the platform charges, and therefore the figure that
+// should move when spans are released.
+func mappedBytes() uint64 {
+	samples := []metrics.Sample{
+		{Name: "/memory/classes/total:bytes"},
+		{Name: "/memory/classes/heap/released:bytes"},
+	}
+	metrics.Read(samples)
+
+	total := uint64Value(samples[0])
+	released := uint64Value(samples[1])
+	if released > total {
+		return 0
+	}
+	return total - released
 }
 
 func uint64Value(s metrics.Sample) uint64 {

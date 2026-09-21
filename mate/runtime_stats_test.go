@@ -97,6 +97,46 @@ func TestNumGCAdvancesAcrossACollection(t *testing.T) {
 	}
 }
 
+// The whole value of ReleaseOSMemoryJSON is that mapped memory goes DOWN, so a
+// version that reported two identical numbers would be useless while looking
+// like it worked. This grows the heap, drops it, and asserts the release is
+// visible.
+func TestReleaseOSMemoryReturnsMappedSpansToTheOS(t *testing.T) {
+	// Garbage large enough to force new spans to be mapped, then unreachable.
+	func() {
+		ballast := make([][]byte, 0, 256)
+		for i := 0; i < 256; i++ {
+			ballast = append(ballast, make([]byte, 256*1024))
+		}
+		_ = ballast
+	}()
+
+	raw := ReleaseOSMemoryJSON()
+	if raw == "{}" {
+		t.Fatalf("ReleaseOSMemoryJSON returned the encode-failure sentinel")
+	}
+
+	var result struct {
+		BeforeBytes uint64 `json:"beforeBytes"`
+		AfterBytes  uint64 `json:"afterBytes"`
+	}
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		t.Fatalf("undecodable JSON: %v (%s)", err, raw)
+	}
+
+	if result.BeforeBytes == 0 {
+		t.Error("BeforeBytes is 0; the mapped-bytes metrics did not resolve")
+	}
+	if result.AfterBytes > result.BeforeBytes {
+		t.Errorf("mapped memory grew across a release: %d -> %d",
+			result.BeforeBytes, result.AfterBytes)
+	}
+	if result.AfterBytes == result.BeforeBytes {
+		t.Errorf("mapped memory did not move (%d both sides) — the release had no effect on the figure it reports",
+			result.BeforeBytes)
+	}
+}
+
 // ReleasedBytes exists so a caller can compute total-minus-released as a
 // footprint proxy. A released figure that exceeded total would make that
 // subtraction negative and the proxy nonsense, so the relation is the contract.

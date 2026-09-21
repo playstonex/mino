@@ -27,34 +27,28 @@ func init() {
 		runtimeDebug.SetMemoryLimit(iosMemLimit)
 		// Network Extension has limited CPU budget.
 		runtime.GOMAXPROCS(3)
-		// 100, not 50, and the reasoning matters because this was 50 and the
-		// process livelocked.
+		// 50. This was raised to 100 on the theory that GC CPU was the binding
+		// constraint, and the device then refuted it: measured GC CPU is 0.0%
+		// to 0.5%, nowhere near the runtime's 50%-of-budget limiter, and
+		// measured process CPU is 1% of a core. There is no GC CPU problem to
+		// trade footprint for, so the trade was all cost.
 		//
-		// SetMemoryLimit is a SOFT limit: breaching it does not fail an
-		// allocation, it makes the collector run harder and harder to get back
-		// under, up to the runtime's 50%-of-CPU GC limiter. On a tunnel with
-		// GOMAXPROCS(3) on efficiency cores that presents as the extension
-		// being unable to move packets — unresponsive, not crashed.
+		// What the device did report, via Xcode on 2026-09-21 14:13:35, is
+		// `Terminated due to memory issue` — SIGKILL 9 on the process
+		// footprint. And the shape of the growth says the soft limit above
+		// cannot prevent it: live heap stays at 5-15 MB while total mapped
+		// climbs (measured 9.6 -> 18.7 -> 26.5 MB over 90 s, with footprint
+		// tracking it at 15.4 -> 24.6 -> 33.1 MB). SetMemoryLimit is compared
+		// against LIVE HEAP, which never approaches 40 MB, so it never
+		// intervenes — while the quantity iOS actually kills on keeps rising.
 		//
-		// That is what was captured on 2026-09-21: an Xcode thread dump taken
-		// while the tunnel was down under a saturating speedtest showed two GC
-		// mark workers draining concurrently at a 48.4 MB footprint, with NO
-		// crash report and NO JetsamEvent. No Jetsam kill means the footprint
-		// was survivable and CPU was the binding constraint, not RSS.
-		//
-		// The 40 MB limit above already guarantees the ceiling on its own — as
-		// the heap approaches it the runtime collects earlier regardless of
-		// this value. So GOGC's only remaining job is steady-state pacing, and
-		// 50 was paying extra GC CPU for a bound the memory limit already
-		// enforces. 100 trades a little idle heap footprint for materially
-		// less GC CPU, which is the axis that actually failed.
-		//
-		// Changed ALONE, on purpose: the 40 MB limit is left exactly as it was
-		// so the next device run measures one variable. Picking a new limit
-		// needs the live-heap number from GetRuntimeStatsJSON
-		// (mate/runtime_stats.go), which did not exist before this change —
-		// the old value could only have been guessed at.
-		const iosGCPercent = 100
+		// GOGC is the lever that does bear on mapped memory: it decides how
+		// much garbage accumulates before a collection, and therefore how many
+		// spans the heap has to have mapped to hold it. Lower means collect
+		// sooner, retain less, map less. 50 costs GC CPU that measurement shows
+		// is available in abundance, and buys back the only resource that is
+		// actually scarce here.
+		const iosGCPercent = 50
 		runtimeDebug.SetGCPercent(iosGCPercent)
 		recordRuntimeLimits(iosMemLimit, iosGCPercent)
 
