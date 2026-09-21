@@ -39,33 +39,36 @@ import (
 var InterfaceName = "Meta"
 var EnforceBindInterface = false
 
-// iOSMaxTCPWindowBytes bounds tun.tcp-window-bytes on iOS. gVisor's
-// TCPReceiveBufferSizeRangeOption/TCPSendBufferSizeRangeOption (stack_gvisor.go)
-// set Default==Max GLOBALLY for every TCP connection on the stack, not per
-// socket -- so total buffer footprint scales with window * 2 (send+receive) *
-// concurrent connections.
+// iOSMaxTCPWindowBytes bounds tun.tcp-window-bytes on iOS.
 //
-// 20 KB: gVisor's own stock value, and the arithmetic now rests on measurement
-// rather than the estimate it replaces. This was 32 KB, chosen from a guess of
-// "150 connections" before anything on the device could count them. Instrumented
-// runs since then have measured the real shape of a saturating speedtest: the
-// extension reached 416 goroutines (about 208 concurrent relayed connections)
-// with a 22.8 MB live heap, and was SIGKILLed at a 47.2 MB process footprint.
+// WHAT THIS NUMBER MEANS CHANGED. It used to be a per-connection reservation:
+// sing-tun set gVisor's Default and Max to the same value, so every connection
+// sat at it and total cost was window * 2 * connections. That forced a choice
+// between two measured failures -- 32 KB across 208 concurrent connections took
+// the Network Extension to a 47 MB footprint and a SIGKILL, while 20 KB survived
+// and collapsed throughput to 3.37 Mbps.
 //
-//	32 KB * 2 * 208 conns = 13.6 MB
-//	20 KB * 2 * 208 conns =  8.5 MB
+// sing-tun now separates them: every connection STARTS at 20 KB and
+// TCPModerateReceiveBufferOption grows only the ones with data in flight, up to
+// this ceiling. So this bounds growth rather than reserving space, and the
+// arithmetic that matters is aggregate:
 //
-// So the previous ceiling was spending roughly 5 MB more than stock on the one
-// term that scales with connection count, inside a budget that turned out to
-// have about 3 MB of headroom left at the moment of death. Raising the stock
-// ceiling at all was a throughput optimisation taken before the memory cost was
-// measurable; it is not affordable on this platform.
+//	throughput = total window in flight / RTT
+//	100 Mbps at the ~150 ms path to the proxy needs 1.875 MB IN AGGREGATE
 //
-// This is a CEILING, not a default: a config asking for less still gets less.
-// And it is a mitigation, not a bound -- nothing here limits concurrent
-// connections, so a heavier load still scales past it. See
-// docs/TUN_STACK_OPTIMIZATION.md.
-const iOSMaxTCPWindowBytes = 20 * 1024
+// Under 2 MB total, across every connection, buys back the full line rate. The
+// expensive thing was never the ceiling; it was reserving the ceiling for
+// hundreds of connections that had nothing to send.
+//
+// 512 KB per connection lets a speedtest's handful of bulk flows reach that
+// aggregate (4 flows x 512 KB = 2 MB, which is 100+ Mbps at this RTT) while
+// bounding the worst case to something the ~50 MB process budget survives. A
+// ceiling of 2 MB per connection would serve one flow at line rate but lets
+// four of them reserve 8 MB, which is the shape that died.
+//
+// This is a CEILING, not a default: a config asking for less still gets less,
+// and nothing here bounds concurrent connections.
+const iOSMaxTCPWindowBytes = 512 * 1024
 
 // clampTCPWindowBytesForGOOS is the pure, platform-parameterized policy:
 // separated from clampTCPWindowBytes so it can be unit tested on any build
