@@ -303,10 +303,15 @@ func NewBbrSender(
 	initialCongestionWindowPackets congestion.ByteCount,
 	profile Profile,
 ) *bbrSender {
+	// Both window bounds go through the platform policy in cwnd_ceiling.go:
+	// on iOS the congestion window is the only thing bounding aggregate
+	// in-flight bytes, and the default 20000-packet cap authorises more of them
+	// than the Network Extension's memory budget can hold.
+	initialWindowPackets, maxWindowPackets := congestionWindowPackets(initialCongestionWindowPackets)
 	return newBbrSender(
 		initialMaxDatagramSize,
-		initialCongestionWindowPackets*initialMaxDatagramSize,
-		congestion.MaxCongestionWindowPackets*initialMaxDatagramSize,
+		initialWindowPackets*initialMaxDatagramSize,
+		maxWindowPackets*initialMaxDatagramSize,
 		profile,
 	)
 }
