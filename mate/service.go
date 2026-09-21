@@ -21,30 +21,40 @@ import (
 func init() {
 	switch runtime.GOOS {
 	case "ios":
-		// 20 MB, and the number is derived rather than chosen.
+		// 40 MB, restored after 20 MB was measured to be actively harmful.
 		//
-		// This was 40 MB on the reasoning that an iOS Network Extension gets
-		// ~50 MB and Go should be left most of it. Measurement showed that
-		// makes the limit UNREACHABLE: the process is killed on its
-		// phys_footprint, and footprint runs about 24 MB ahead of the live heap
-		// (measured across one kill: 18.5 vs 3.5, 22.4 vs 4.6, 32.5 vs 10.2,
-		// 47.2 vs 22.8). So the fatal heap is ~23 MB, and a limit set at 40 MB
-		// can only ever be crossed by a process that is already dead. Every run
-		// died with the limit reporting 57-65% used.
+		// The reasoning for 20 MB was arithmetically sound and empirically
+		// wrong. footprint runs ~19 MB ahead of live heap and iOS kills at
+		// ~50 MB, so a heap ceiling of 20 MB keeps footprint at a safe 39 MB.
+		// What that reasoning missed is that the workload's real demand is
+		// ~28 MB of LIVE heap, and a soft limit below demand does not cap
+		// anything -- it makes the collector chase a target it cannot reach:
 		//
-		//	footprint <= 44 MB  =>  live heap <= 20 MB
+		//	heap=21.5MiB (107% of limit)  numGC= 98  gc-cpu=12.5%
+		//	heap=28.3MiB (141%)           numGC=154  gc-cpu=11.9%
+		//	heap=26.0MiB (130%)           numGC=219  gc-cpu=32.0%
+		//	heap= 5.2MiB ( 26%)           numGC=635  gc-cpu=41.6%  proc-cpu=82%
 		//
-		// 44 MB rather than the ~50 MB ceiling because a limit that binds only
-		// at the kill line has no time to act.
+		// 635 collections and 41.6% of the CPU budget in GC, against the
+		// runtime's own 50% limiter. Throughput measured 3.45 Mbps -- the
+		// extension was spending its CPU collecting rather than moving packets.
+		// footprint still reached 47.4 MB, so the limit did not even buy the
+		// safety it was chosen for.
 		//
-		// The trade-off is deliberate and is NOT free: a soft limit does not
-		// fail allocations, it makes the collector work harder, so a transfer
-		// that wants more than 20 MB of live heap will now see GC CPU climb and
-		// throughput fall instead of the tunnel dying. Measured GC CPU at the
-		// old cliff was already 16-19%, so expect more. That is the intended
-		// exchange -- degraded and alive beats killed and reconnecting, because
-		// a kill drops every connection while back-pressure only slows them.
-		const iosMemLimit = 20 * 1024 * 1024
+		// 40 MB is above demand, so the pacer does not bind at the working
+		// point and the data path gets its CPU back. Anything nearer 28 MB
+		// reintroduces the spiral, because the limit-based GC target tightens
+		// as the heap APPROACHES the limit, not only when it crosses.
+		//
+		// This is a deliberate trade, not a fix. It restores full throughput
+		// and restores the ~62 s SIGKILL under sustained saturation, which the
+		// app-side self-heal reconnects from. The real bind is that measured
+		// demand (28 MB heap -> 47 MB footprint) does not fit a ~50 MB budget
+		// with Go's ~19 MB of runtime overhead on top, and no value of this
+		// constant satisfies both sides. What closes it is bounding aggregate
+		// in-flight bytes -- gVisor's receive-buffer moderation is per
+		// connection and nothing limits the sum.
+		const iosMemLimit = 40 * 1024 * 1024
 		runtimeDebug.SetMemoryLimit(iosMemLimit)
 		// Network Extension has limited CPU budget.
 		runtime.GOMAXPROCS(3)
