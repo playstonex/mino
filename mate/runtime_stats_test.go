@@ -96,3 +96,33 @@ func TestNumGCAdvancesAcrossACollection(t *testing.T) {
 		t.Errorf("NumGC did not advance across runtime.GC(): %d then %d", before, after)
 	}
 }
+
+// ReleasedBytes exists so a caller can compute total-minus-released as a
+// footprint proxy. A released figure that exceeded total would make that
+// subtraction negative and the proxy nonsense, so the relation is the contract.
+func TestReleasedBytesIsCoherentWithTotal(t *testing.T) {
+	stats := decodeStats(t)
+
+	if stats.ReleasedBytes > stats.TotalBytes {
+		t.Errorf("ReleasedBytes (%d) > TotalBytes (%d); released spans are part of total",
+			stats.ReleasedBytes, stats.TotalBytes)
+	}
+}
+
+func TestGoroutineCountIsPopulated(t *testing.T) {
+	stats := decodeStats(t)
+
+	// The test binary itself is running goroutines, so 0 can only mean the
+	// metric name stopped resolving.
+	if stats.Goroutines == 0 {
+		t.Error("Goroutines is 0; the /sched/goroutines:goroutines metric did not resolve")
+	}
+
+	// Cross-check against the runtime's own counter. They are sampled at
+	// slightly different instants, so this asserts the same order of magnitude
+	// rather than equality -- enough to catch a constant or a wrong metric.
+	if own := uint64(runtime.NumGoroutine()); stats.Goroutines > own*4+16 {
+		t.Errorf("Goroutines = %d, implausible against runtime.NumGoroutine() = %d",
+			stats.Goroutines, own)
+	}
+}

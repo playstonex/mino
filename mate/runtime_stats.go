@@ -38,10 +38,17 @@ type runtimeStats struct {
 	// actually compared against, and therefore the one that decides whether
 	// the runtime is about to start GCing continuously.
 	HeapBytes uint64 `json:"heapBytes"`
-	// TotalBytes is everything the Go runtime has mapped. This is closer to
-	// what the platform's own footprint accounting (and thus Jetsam) sees, and
-	// is always larger than HeapBytes.
+	// TotalBytes is everything the Go runtime has mapped, INCLUDING spans it
+	// has already handed back to the OS. On its own it therefore overstates
+	// what the platform charges this process: subtract ReleasedBytes for a
+	// Go-side footprint proxy. The authoritative number is the task's
+	// phys_footprint, which only the Swift side can read.
 	TotalBytes uint64 `json:"totalBytes"`
+	// ReleasedBytes is heap memory returned to the OS but still mapped. This
+	// exists because the 2026-09-21 run reported totalBytes=41.4 MiB against a
+	// live heap of 10.4 MiB, and there was no way to tell how much of that
+	// 31 MiB gap was actually charged to the process.
+	ReleasedBytes uint64 `json:"releasedBytes"`
 	// MemLimitBytes is the soft limit in force, or 0 when unlimited. A soft
 	// limit is not a failure point: exceeding it makes Go GC harder, not
 	// allocate-fail, which is why breaching it presents as unresponsiveness
@@ -55,6 +62,10 @@ type runtimeStats struct {
 	// CPU budget GC is consuming. That fraction is the death-spiral signal.
 	GCCPUSeconds float64 `json:"gcCpuSeconds"`
 	GOMAXPROCS   int     `json:"gomaxprocs"`
+	// Goroutines is included because a saturating transfer that leaks or
+	// blocks goroutines raises the stack footprint without raising the live
+	// heap, which would otherwise look like "memory is fine".
+	Goroutines uint64 `json:"goroutines"`
 }
 
 // GetRuntimeStatsJSON reports Go runtime memory and GC state as JSON.
@@ -70,6 +81,8 @@ func GetRuntimeStatsJSON() string {
 		{Name: "/memory/classes/total:bytes"},
 		{Name: "/gc/cycles/total:gc-cycles"},
 		{Name: "/cpu/classes/gc/total:cpu-seconds"},
+		{Name: "/memory/classes/heap/released:bytes"},
+		{Name: "/sched/goroutines:goroutines"},
 	}
 	metrics.Read(samples)
 
@@ -81,6 +94,8 @@ func GetRuntimeStatsJSON() string {
 		NumGC:         uint64Value(samples[2]),
 		GCCPUSeconds:  float64Value(samples[3]),
 		GOMAXPROCS:    runtime.GOMAXPROCS(0),
+		ReleasedBytes: uint64Value(samples[4]),
+		Goroutines:    uint64Value(samples[5]),
 	}
 
 	encoded, err := json.Marshal(stats)
