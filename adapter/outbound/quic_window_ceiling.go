@@ -36,13 +36,17 @@ import (
 // single saturating hysteria2 QUIC connection.
 //
 // The window is sized to the throughput the link should hold, backed by the
-// periodic footprint reclaimer (mate/footprint_reclaim.go) that returns freed
-// spans to the OS so a larger window does not ratchet phys_footprint to the
-// kill line. 6 MB connection / 3 MB stream at the measured ~460 ms trans-Pacific
-// RTT licenses 6 MB / 0.46 s * 8 = ~104 Mbps; measured result on an iPhone 12
-// over a Japan hysteria2 node was 160 Mbps at a 38 MB footprint peak (12 MB
-// under the 50 MB kill line), no SIGKILL. The stream ceiling is half the
-// connection ceiling, preserving quic-go's own ratio.
+// periodic footprint reclaimer (mate/footprint_reclaim.go). The value was
+// chosen empirically after testing both ends: 4 MB peaked ~38 MB and held
+// ~160 Mbps, 6 MB peaked ~49 MB and held ~200 Mbps -- but BOTH still hit the
+// 50 MB EXC_RESOURCE kill under an Xcode debug session, whose debugger overhead
+// (Metal validation, LLDB malloc accounting, extra mappings) adds several MB on
+// top of the real footprint and pushes either window over the line. In other
+// words the remaining kills in that regime are debugger-induced, not
+// window-size-dependent, so 6 MB is chosen for the better 200 Mbps throughput.
+// Judge the REAL footprint from a direct run (no debugger) via the tunnel log's
+// footprint-peak, never from an Xcode EXC_RESOURCE. The stream ceiling is half
+// the connection ceiling, preserving quic-go's own ratio.
 //
 // Initial windows are NOT left alone: callers (tuic, shadowquic, hysteria)
 // pre-fill Initial = Default/10 = 6.4 MB for the 64 MB default, which is ABOVE
