@@ -97,6 +97,26 @@ func clampTCPWindowBytes(v int) int {
 	return clampTCPWindowBytesForGOOS(runtime.GOOS, v)
 }
 
+// processorsPerChannelForGOOS returns the gVisor per-channel processor count for
+// a platform. gVisor runs this many packet-handling goroutines per TUN channel,
+// each with its own buffers; sing-tun's default is max(1, GOMAXPROCS/#FDs),
+// which on iOS (GOMAXPROCS pinned to 3, one FD) opens 3. Inside the ~50MB
+// Network Extension budget the extra two processors' goroutines and buffers are
+// memory the extension cannot spare and peak throughput it does not need, so iOS
+// is pinned to 1 (upstream MetaCubeX made the same trade for memory-constrained
+// hosts in 92433dba). 0 means "use sing-tun's default", which every other
+// platform keeps.
+func processorsPerChannelForGOOS(goos string) int {
+	if goos == "ios" {
+		return 1
+	}
+	return 0
+}
+
+func processorsPerChannel() int {
+	return processorsPerChannelForGOOS(runtime.GOOS)
+}
+
 type Listener struct {
 	closed  bool
 	options LC.Tun
@@ -476,6 +496,7 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 		InterfaceMonitor:                      defaultInterfaceMonitor,
 		EXP_RecvMsgX:                          options.RecvMsgX,
 		EXP_SendMsgX:                          options.SendMsgX,
+		EXP_ProcessorsPerChannel:              processorsPerChannel(),
 	}
 
 	if options.AutoRedirect {
