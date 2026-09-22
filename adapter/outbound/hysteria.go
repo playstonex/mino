@@ -207,6 +207,12 @@ func NewHysteria(option HysteriaOption) (*Hysteria, error) {
 		quicConfig.InitialConnectionReceiveWindow = DefaultConnectionReceiveWindow / 10
 		quicConfig.MaxConnectionReceiveWindow = DefaultConnectionReceiveWindow
 	}
+	// hysteria v1 fills the same 64MB default (and a 6.4MB Initial) that tuic
+	// does; without this cap an iOS Network Extension is punched straight
+	// through its ~50MB budget the moment a hysteria v1 node is used. The
+	// ceiling also clamps Initial<=Max, so the 6.4MB Initial cannot outrun the
+	// capped Max. See quic_window_ceiling.go.
+	applyPlatformQUICWindowCeiling(quicConfig)
 	if !quicConfig.DisablePathMTUDiscovery && pmtud_fix.DisablePathMTUDiscovery {
 		log.Infoln("hysteria: Path MTU Discovery is not yet supported on this platform")
 	}

@@ -521,8 +521,15 @@ func handleTCPConn(connCtx C.ConnContext) {
 	// (gVisor buffers, QUIC StreamFrame pool, congestion window, relay
 	// buffers) shares; without it, aggregate memory = per_conn x N with N
 	// unbounded, which is what SIGKILLs the iOS Network Extension under a
-	// saturating multi-stream transfer. No-op on every other platform.
-	releaseTCPConnSlot := acquireTCPConnSlot()
+	// saturating multi-stream transfer. No-op on every other platform. The wait
+	// is bounded: if every slot is held by idle long-lived connections, a new
+	// one is dropped rather than blocked forever.
+	releaseTCPConnSlot, ok := acquireTCPConnSlot()
+	if !ok {
+		log.Warnln("[TCP] connection ceiling full for %s, dropping new connection", connCtx.Metadata().RemoteAddress())
+		_ = connCtx.Conn().Close()
+		return
+	}
 	defer releaseTCPConnSlot()
 
 	defer func(conn net.Conn) {

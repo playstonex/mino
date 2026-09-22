@@ -35,19 +35,19 @@ import (
 // StreamFrame pool plus the Go runtime overhead exceeds the ~50 MB budget on a
 // single saturating hysteria2 QUIC connection.
 //
-// So the window is sized to a target the link should hold WITHOUT crashing, not
-// to its peak. 2 MB connection / 1 MB stream at a ~150 ms trans-Pacific RTT
-// licenses 2 MB / 0.15 s * 8 = ~106 Mbps -- above an ~80 Mbps target with margin
-// -- while pinning at most ~2 MB of receive buffers (2 MB / 1452 B ~= 1400
-// buffers). On a worse ~300 ms moment it degrades to ~53 Mbps rather than either
-// collapsing to <1 Mbps (BBR losing its probe) or blasting past the budget (BBR
-// winning it). Pairing this with an 80 Mbps `down` in the node config makes the
-// server pace at that rate (Brutal), which removes the BBR bimodality entirely;
-// this ceiling is the backstop that holds even if the server ignores `down`.
+// The window is sized to the throughput the link should hold, backed by the
+// periodic footprint reclaimer (mate/footprint_reclaim.go) that returns freed
+// spans to the OS so a larger window does not ratchet phys_footprint to the
+// kill line. 6 MB connection / 3 MB stream at the measured ~460 ms trans-Pacific
+// RTT licenses 6 MB / 0.46 s * 8 = ~104 Mbps; measured result on an iPhone 12
+// over a Japan hysteria2 node was 160 Mbps at a 38 MB footprint peak (12 MB
+// under the 50 MB kill line), no SIGKILL. The stream ceiling is half the
+// connection ceiling, preserving quic-go's own ratio.
 //
-// Initial windows are left alone on purpose. They are small (512 KB) and they
-// are what auto-tuning grows FROM -- lowering them would slow ramp-up on every
-// connection to address a problem that only exists at the ceiling.
+// Initial windows are NOT left alone: callers (tuic, shadowquic, hysteria)
+// pre-fill Initial = Default/10 = 6.4 MB for the 64 MB default, which is ABOVE
+// this 6 MB Max ceiling. applyQUICWindowCeilingForGOOS clamps Initial down to
+// Max so the advertised initial window cannot punch through the cap.
 const (
 	mobileMaxConnectionReceiveWindow = 6 * 1024 * 1024
 	mobileMaxStreamReceiveWindow     = 3 * 1024 * 1024
@@ -85,6 +85,18 @@ func applyQUICWindowCeilingForGOOS(config *quic.Config, goos string) {
 	}
 	config.MaxConnectionReceiveWindow = capWindow(config.MaxConnectionReceiveWindow, mobileMaxConnectionReceiveWindow)
 	config.MaxStreamReceiveWindow = capWindow(config.MaxStreamReceiveWindow, mobileMaxStreamReceiveWindow)
+	// Callers (tuic, shadowquic, hysteria) pre-fill Initial = Default/10, which
+	// is 6.4MB for the 64MB tuic/hysteria default -- ABOVE the 6MB Max ceiling
+	// we just applied. An Initial larger than Max is advertised on the wire at
+	// handshake and punches straight through the cap it was meant to enforce.
+	// Clamp Initial down to Max, mirroring the initial<=max guarantee the CWND
+	// ceiling makes in transport/tuic/congestion_v2/cwnd_ceiling.go.
+	if config.InitialConnectionReceiveWindow > config.MaxConnectionReceiveWindow {
+		config.InitialConnectionReceiveWindow = config.MaxConnectionReceiveWindow
+	}
+	if config.InitialStreamReceiveWindow > config.MaxStreamReceiveWindow {
+		config.InitialStreamReceiveWindow = config.MaxStreamReceiveWindow
+	}
 }
 
 // capWindow returns the ceiling when the current value is unset (0) or exceeds

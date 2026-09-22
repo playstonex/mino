@@ -67,18 +67,26 @@ func startFootprintReclaimer() {
 }
 
 // reclaimLoop is the testable core: every interval, if mapped bytes exceed the
-// threshold, force spans back to the OS and log what it recovered.
+// threshold, force spans back to the OS and log only when the reclaim actually
+// recovered something worth noting.
 func reclaimLoop(interval time.Duration, threshold uint64) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// Only a reclaim that frees at least this much is worth a log line. A
+	// sustained large download keeps mapped bytes hovering at the threshold, so
+	// an unconditional Info log here would print at 1 Hz for the whole transfer
+	// and drown the tunnel log; gating on a real recovery keeps the signal.
+	const logMinRecovered = 1 * 1024 * 1024
 	for range ticker.C {
-		if mappedBytes() < threshold {
+		before := mappedBytes()
+		if before < threshold {
 			continue
 		}
-		before := mappedBytes()
 		runtimeDebug.FreeOSMemory()
 		after := mappedBytes()
-		log.Infoln("[GoHeap] periodic reclaim: mapped %.1fMiB -> %.1fMiB (threshold %.1fMiB)",
-			float64(before)/1024/1024, float64(after)/1024/1024, float64(threshold)/1024/1024)
+		if before > after && before-after >= logMinRecovered {
+			log.Infoln("[GoHeap] periodic reclaim: mapped %.1fMiB -> %.1fMiB (threshold %.1fMiB)",
+				float64(before)/1024/1024, float64(after)/1024/1024, float64(threshold)/1024/1024)
+		}
 	}
 }

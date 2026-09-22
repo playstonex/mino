@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"testing"
+	"time"
 )
 
 func TestNewTCPConnSemIsIOSOnly(t *testing.T) {
@@ -57,5 +58,17 @@ func TestTCPConnSemFillsToCapacityThenReleaseUnblocks(t *testing.T) {
 	case sem <- struct{}{}:
 	default:
 		t.Fatal("after releasing a slot a new acquire should succeed")
+	}
+}
+
+func TestAcquireTimeoutIsPositiveAndBounded(t *testing.T) {
+	// A zero/absent timeout reintroduces the unbounded-block starvation the
+	// bounded acquire exists to prevent; an excessively long one makes a full
+	// pool feel like a hang to the user.
+	if acquireTimeout <= 0 {
+		t.Fatalf("acquire timeout must be positive, got %v", acquireTimeout)
+	}
+	if acquireTimeout > 60*time.Second {
+		t.Fatalf("acquire timeout %v is too long; a full pool would look like a hang", acquireTimeout)
 	}
 }

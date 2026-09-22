@@ -3,6 +3,7 @@ package tunnel
 import (
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/metacubex/mihomo/log"
 )
@@ -60,18 +61,42 @@ func newTCPConnSem(goos string) chan struct{} {
 var logTCPConnCeilingOnce sync.Once
 
 // acquireTCPConnSlot blocks until a connection slot is free on a memory-capped
-// platform, and returns a release func to call when the connection is done.
-// On every other platform it is a no-op returning a no-op release.
-func acquireTCPConnSlot() func() {
+// platform, and returns a release func plus ok=true. On every other platform it
+// is a no-op returning a no-op release and ok=true.
+//
+// The wait is BOUNDED. A slot is held for the whole connection lifetime, and
+// iOS accumulates many idle-but-open long-lived connections (push, chat
+// heartbeats, backgrounded keep-alives) that occupy slots while moving no data.
+// If all 128 were held by such connections, an unbounded `sem <- struct{}{}`
+// would make a fresh foreground request block forever -- the user sees a hang,
+// not backpressure. So the acquire waits at most acquireTimeout; on timeout it
+// returns ok=false and the caller closes the connection rather than dialing an
+// outbound for a request that has been waiting too long. Under normal load the
+// slot is free immediately and the timeout never arms.
+const acquireTimeout = 10 * time.Second
+
+func acquireTCPConnSlot() (release func(), ok bool) {
 	sem := tcpConnSem
 	if sem == nil {
-		return func() {}
+		return func() {}, true
 	}
 	logTCPConnCeilingOnce.Do(func() {
 		log.Infoln("[TCP] concurrent proxied-connection ceiling active: %d "+
 			"(bounds the multiplier every per-connection memory cap shares, "+
 			"inside the ~50MB Network Extension budget)", iOSMaxConcurrentTCPConns)
 	})
-	sem <- struct{}{}
-	return func() { <-sem }
+	// Fast path: a free slot is taken without arming a timer.
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, true
+	default:
+	}
+	timer := time.NewTimer(acquireTimeout)
+	defer timer.Stop()
+	select {
+	case sem <- struct{}{}:
+		return func() { <-sem }, true
+	case <-timer.C:
+		return func() {}, false
+	}
 }
