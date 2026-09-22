@@ -131,7 +131,7 @@ func TestQUICWindowCeilingClampsInitialToMax(t *testing.T) {
 	config := &quic.Config{
 		InitialConnectionReceiveWindow: tuicDefault / 10, // 6.4 MB, above the 6 MB Max
 		MaxConnectionReceiveWindow:     tuicDefault,
-		InitialStreamReceiveWindow:     (15 * 1024 * 1024) / 10, // 1.5 MB, above the 3 MB? no -> below
+		InitialStreamReceiveWindow:     tuicDefault / 10, // 6.4 MB, above the 3 MB stream Max — exercises the stream clamp
 		MaxStreamReceiveWindow:         15 * 1024 * 1024,
 	}
 	applyQUICWindowCeilingForGOOS(config, "ios")

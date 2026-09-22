@@ -670,6 +670,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 					return v.streamTLSConn(ctx, raw, isH2)
 				},
 				func(ctx context.Context, cfg *quic.Config) (*quic.Conn, error) {
+					applyPlatformQUICWindowCeiling(cfg)
 					host, _, _ := net.SplitHostPort(v.addr)
 					tlsOpts := &vmess.TLSConfig{
 						Host:              host,
@@ -858,6 +859,7 @@ func NewVless(option VlessOption) (*Vless, error) {
 						return conn, nil
 					},
 					func(ctx context.Context, cfg *quic.Config) (*quic.Conn, error) {
+						applyPlatformQUICWindowCeiling(cfg)
 						host, _, _ := net.SplitHostPort(downloadAddr)
 						tlsOpts := &vmess.TLSConfig{
 							Host:              host,

@@ -164,6 +164,16 @@ func NewShadowQuic(option ShadowQuicOption) (*ShadowQuic, error) {
 	if isMemoryCappedGOOS(runtime.GOOS) {
 		quicConfig.MaxConnectionReceiveWindow = capWindow(quicConfig.MaxConnectionReceiveWindow, mobileMaxConnectionReceiveWindow)
 		quicConfig.MaxStreamReceiveWindow = capWindow(quicConfig.MaxStreamReceiveWindow, mobileMaxStreamReceiveWindow)
+		// shadowquic uses the jls-quic-go *Config type, so it cannot call the
+		// shared applyPlatformQUICWindowCeiling and must inline the Initial<=Max
+		// clamp: without it the pre-filled Initial (Default/10 = 6.4MB) exceeds
+		// the capped Max (6MB) and is advertised on the wire above the cap.
+		if quicConfig.InitialConnectionReceiveWindow > quicConfig.MaxConnectionReceiveWindow {
+			quicConfig.InitialConnectionReceiveWindow = quicConfig.MaxConnectionReceiveWindow
+		}
+		if quicConfig.InitialStreamReceiveWindow > quicConfig.MaxStreamReceiveWindow {
+			quicConfig.InitialStreamReceiveWindow = quicConfig.MaxStreamReceiveWindow
+		}
 	}
 
 	outbound := &ShadowQuic{

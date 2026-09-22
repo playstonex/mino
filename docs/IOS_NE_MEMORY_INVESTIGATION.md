@@ -149,22 +149,35 @@ bytes，超过 **30 MB** 阈值就调 `debug.FreeOSMemory()`。
 - **测试未 Pin-by-Value（低，已修）**：ceiling 断言改为对字面值 6MB/3MB 断言（经 `wantConnCeiling`/
   `wantStreamCeiling` 常量），并加独立的 pin-check——把常量误改回 64MB 现在会测试失败而非虚假绿灯。
 
+二次审核补充（同样已修）：
+
+- **shadowquic Initial>Max 倒挂（严重，已修）**：shadowquic 用 jls-quic-go 的 `*Config` 类型，
+  无法调共享的 `applyPlatformQUICWindowCeiling`，其内联 cap 块只 cap 了 Max、漏了 Initial，
+  同样的 6.4MB>6MB 倒挂。已在内联块补上 Initial≤Max 钳制。
+- **VLESS xhttp（HTTP/3）默认窗口穿透（中，已确诊并修）**：`transport/xhttp/client.go` 的
+  `QUICConfig` 不设接收窗口（0 值），`common.DialQuic` 把未修改的 cfg 交给 quic-go，后者套用
+  15MB 连接 / 6MB 流的默认值，绕过 6MB/3MB 保护。已在 `adapter/outbound/vless.go` 两个 xhttp
+  QUIC 回调入口加 `applyPlatformQUICWindowCeiling(cfg)`。
+- **Initial 倒挂回归测试加强**：`TestQUICWindowCeilingClampsInitialToMax` 原先 stream Initial 设
+  1.5MB（本就低于 3MB，没真正测到 stream clamp 分支），已改为 6.4MB，让连接级和流级两个 Initial
+  倒挂分支都被触发。
+
+至此 iOS 上 hysteria1/hysteria2/tuic/shadowquic/masque/vless-xhttp 六条 QUIC 路径均受 6MB/3MB
+硬边界约束，无协议可绕过。
+
 ## 七、仍未处理 / 遗漏
 
 以下均**不是**当前崩溃的原因，按优先级记录：
 
-1. **VLESS xhttp（待查证）**：`adapter/outbound/vless.go` 的 xhttp 传输走 HTTP/3 over QUIC
-   （`transport/xhttp`），是否经过平台 ceiling 未确认。需读 `transport/xhttp` 核实其 QUIC 栈
-   构造与窗口默认值，再决定是否补 ceiling。
-2. **statistic map**（`tunnel/statistic/manager.go`）：`connections` map 无 cap/TTL，
+1. **statistic map**（`tunnel/statistic/manager.go`）：`connections` map 无 cap/TTL，
    靠 `Leave` 删除。`Leave` 漏调的路径会永久泄漏。协议无关，值得单独查 Tracker 生命周期。
-3. **NAT 表**（`component/nat/table.go`）：`mapping` 无硬 cap，靠 60s 超时回收，
+2. **NAT 表**（`component/nat/table.go`）：`mapping` 无硬 cap，靠 60s 超时回收，
    UDP 泛洪期尖峰。
-4. **PathMonitor 重连抖动**：app（Swift）侧，接口切换即断速；治法是加去抖窗口，与本文的
+3. **PathMonitor 重连抖动**：app（Swift）侧，接口切换即断速；治法是加去抖窗口，与本文的
    mihomo 内存优化是两件事。
-5. **Swift 侧 15s 反应式回收冷却**：已被 §四的 Go 侧 1s 回收器取代，现为冗余（无害，
+4. **Swift 侧 15s 反应式回收冷却**：已被 §四的 Go 侧 1s 回收器取代，现为冗余（无害，
    两边都调 `FreeOSMemory`，幂等），可清理。
-6. **非 hysteria2 协议**（ss/trojan/tuic/masque/hysteria v1）：封顶代码已在，但仅
+5. **非 hysteria2 协议**（ss/trojan/tuic/masque/hysteria v1）：封顶代码已在，但仅
    hysteria2 真机验证过——切协议时才生效。
 
 ---
