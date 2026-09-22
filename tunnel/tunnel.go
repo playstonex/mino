@@ -516,6 +516,15 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 
+	// Bound the number of concurrent proxied TCP connections on memory-capped
+	// platforms. This is the multiplier every per-connection memory cap
+	// (gVisor buffers, QUIC StreamFrame pool, congestion window, relay
+	// buffers) shares; without it, aggregate memory = per_conn x N with N
+	// unbounded, which is what SIGKILLs the iOS Network Extension under a
+	// saturating multi-stream transfer. No-op on every other platform.
+	releaseTCPConnSlot := acquireTCPConnSlot()
+	defer releaseTCPConnSlot()
+
 	defer func(conn net.Conn) {
 		_ = conn.Close()
 	}(connCtx.Conn())

@@ -83,6 +83,15 @@ func init() {
 		runtimeDebug.SetGCPercent(iosGCPercent)
 		recordRuntimeLimits(iosMemLimit, iosGCPercent)
 
+		// The soft limit and GCPercent above bound the LIVE heap, but the
+		// 2026-09-22 profiles proved the kill is on phys_footprint while the
+		// live heap stays at ~16 MB: freed spans the background scavenger
+		// cannot return fast enough under packet churn. Arm a periodic,
+		// threshold-gated FreeOSMemory that forces those spans back to the OS
+		// (via MADV_FREE_REUSABLE, which leaves phys_footprint) before Jetsam
+		// charges for them. See footprint_reclaim.go.
+		startFootprintReclaimer()
+
 	case "darwin":
 		// macOS has no meaningful memory constraint for Network Extension.
 		// Leave defaults (no memory limit, GOMAXPROCS = NumCPU, GCPercent = 100).

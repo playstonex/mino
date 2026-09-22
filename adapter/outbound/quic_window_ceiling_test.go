@@ -62,8 +62,8 @@ func TestQUICWindowCeilingCapsExplicitLargerConfig(t *testing.T) {
 // A window explicitly set BELOW the ceiling is a genuine preference to reduce
 // memory further, and must be left alone.
 func TestQUICWindowCeilingHonoursSmallerExplicitConfig(t *testing.T) {
-	const requestedConn = 1 * 1024 * 1024  // below the 4MB ceiling
-	const requestedStream = 512 * 1024     // below the 2MB ceiling
+	const requestedConn = 1 * 1024 * 1024 // below the 2MB conn ceiling
+	const requestedStream = 512 * 1024    // below the 1MB stream ceiling
 
 	config := &quic.Config{
 		MaxConnectionReceiveWindow: requestedConn,
@@ -85,7 +85,7 @@ func TestQUICWindowCeilingHonoursSmallerExplicitConfig(t *testing.T) {
 // forgotten. The forgotten one must still be bounded, and a set-but-small one
 // honoured.
 func TestQUICWindowCeilingCapsTheUnsetHalf(t *testing.T) {
-	const requestedStream = 1 * 1024 * 1024 // below the 2MB stream ceiling
+	const requestedStream = 512 * 1024 // below the 1MB stream ceiling
 
 	config := &quic.Config{MaxStreamReceiveWindow: requestedStream}
 	applyQUICWindowCeilingForGOOS(config, "ios")

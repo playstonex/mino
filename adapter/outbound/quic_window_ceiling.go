@@ -24,19 +24,33 @@ import (
 // proxied TCP connection onto ONE QUIC connection, so a single saturating
 // transfer is enough to grow these windows to their permitted maximum.
 //
-// The values are derived from bandwidth-delay product rather than picked for
-// roundness: a window has to hold one round trip of data in flight to avoid
-// capping throughput, and BDP at 180 Mbps over a ~150 ms trans-Pacific path is
-// 180e6 / 8 * 0.15 = 3.4 MB. 4 MB covers that with margin while costing less
-// than a third of what the default permitted. The stream ceiling is half the
-// connection ceiling, preserving quic-go's own ratio.
+// The values target a STABLE, bounded throughput rather than the maximum a
+// good moment could reach. Raising the ceiling to 4 MB restored 100+ Mbps on
+// 2026-09-22 -- and immediately reintroduced the SIGKILL, this time on the
+// RECEIVE path: the crash backtrace was
+// quic-go.(*Transport).listen -> oobConn.ReadPacket -> getPacketBuffer ->
+// makeslice, i.e. received packet buffers pinned in the receive window/reassembly
+// while the app drains them. The count of pinned buffers is window / MTU, so the
+// window IS the receive-side memory bound, and 4 MB of it plus the send-side
+// StreamFrame pool plus the Go runtime overhead exceeds the ~50 MB budget on a
+// single saturating hysteria2 QUIC connection.
+//
+// So the window is sized to a target the link should hold WITHOUT crashing, not
+// to its peak. 2 MB connection / 1 MB stream at a ~150 ms trans-Pacific RTT
+// licenses 2 MB / 0.15 s * 8 = ~106 Mbps -- above an ~80 Mbps target with margin
+// -- while pinning at most ~2 MB of receive buffers (2 MB / 1452 B ~= 1400
+// buffers). On a worse ~300 ms moment it degrades to ~53 Mbps rather than either
+// collapsing to <1 Mbps (BBR losing its probe) or blasting past the budget (BBR
+// winning it). Pairing this with an 80 Mbps `down` in the node config makes the
+// server pace at that rate (Brutal), which removes the BBR bimodality entirely;
+// this ceiling is the backstop that holds even if the server ignores `down`.
 //
 // Initial windows are left alone on purpose. They are small (512 KB) and they
 // are what auto-tuning grows FROM -- lowering them would slow ramp-up on every
 // connection to address a problem that only exists at the ceiling.
 const (
-	mobileMaxConnectionReceiveWindow = 4 * 1024 * 1024
-	mobileMaxStreamReceiveWindow     = 2 * 1024 * 1024
+	mobileMaxConnectionReceiveWindow = 6 * 1024 * 1024
+	mobileMaxStreamReceiveWindow     = 3 * 1024 * 1024
 )
 
 // applyPlatformQUICWindowCeiling bounds the receive windows on platforms with a
