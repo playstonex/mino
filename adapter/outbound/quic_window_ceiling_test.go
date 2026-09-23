@@ -17,8 +17,8 @@ import (
 // be updated deliberately, in lockstep with the constants, so a change is
 // visible in the diff.
 const (
-	wantConnCeiling   = 6 * 1024 * 1024
-	wantStreamCeiling = 3 * 1024 * 1024
+	wantConnCeiling   = 4 * 1024 * 1024
+	wantStreamCeiling = 2 * 1024 * 1024
 )
 
 func TestCeilingConstantsMatchPinnedValues(t *testing.T) {
@@ -124,14 +124,14 @@ func TestQUICWindowCeilingCapsTheUnsetHalf(t *testing.T) {
 
 // Regression for the Initial>Max inversion: tuic/shadowquic/hysteria pre-fill
 // Initial = Default/10 = 6.4MB for the 64MB default, then hand the config here.
-// After the Max is capped to 6MB, an un-clamped Initial of 6.4MB would be
+// After the Max is capped to 4MB, an un-clamped Initial of 6.4MB would be
 // advertised on the wire ABOVE the cap. The ceiling must clamp Initial to Max.
 func TestQUICWindowCeilingClampsInitialToMax(t *testing.T) {
 	const tuicDefault = 64 * 1024 * 1024
 	config := &quic.Config{
-		InitialConnectionReceiveWindow: tuicDefault / 10, // 6.4 MB, above the 6 MB Max
+		InitialConnectionReceiveWindow: tuicDefault / 10, // 6.4 MB, above the 4 MB Max
 		MaxConnectionReceiveWindow:     tuicDefault,
-		InitialStreamReceiveWindow:     tuicDefault / 10, // 6.4 MB, above the 3 MB stream Max — exercises the stream clamp
+		InitialStreamReceiveWindow:     tuicDefault / 10, // 6.4 MB, above the 2 MB stream Max — exercises the stream clamp
 		MaxStreamReceiveWindow:         15 * 1024 * 1024,
 	}
 	applyQUICWindowCeilingForGOOS(config, "ios")

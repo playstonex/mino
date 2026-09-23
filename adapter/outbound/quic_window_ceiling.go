@@ -38,23 +38,31 @@ import (
 // The window is sized to the throughput the link should hold, backed by the
 // periodic footprint reclaimer (mate/footprint_reclaim.go). The value was
 // chosen empirically after testing both ends: 4 MB peaked ~38 MB and held
-// ~160 Mbps, 6 MB peaked ~49 MB and held ~200 Mbps -- but BOTH still hit the
-// 50 MB EXC_RESOURCE kill under an Xcode debug session, whose debugger overhead
-// (Metal validation, LLDB malloc accounting, extra mappings) adds several MB on
-// top of the real footprint and pushes either window over the line. In other
-// words the remaining kills in that regime are debugger-induced, not
-// window-size-dependent, so 6 MB is chosen for the better 200 Mbps throughput.
+// ~160 Mbps, 6 MB peaked ~49 MB and held ~200 Mbps.
+//
+// 2026-09-23 CORRECTION: an earlier note here claimed the 6 MB kills were only
+// Xcode-debugger-induced. A clean DIRECT run (no debugger) disproved that -- the
+// tunnel-log footprint-peak climbed 38.0 -> 41.3 -> 46.5 -> 49.7 MB with
+// PRESSURE(footprint+cpu) and proc-cpu 124%->155%, then the process vanished
+// with NO stopTunnel line (an iOS Jetsam kill leaves no clean-stop record),
+// six times across the session. So 6 MB genuinely rides the 50 MB kill line on
+// a real device, not just under a debugger. The window is therefore held at
+// 4 MB / 2 MB, which peaked ~38 MB (a ~12 MB margin) and holds ~160 Mbps --
+// stability over the extra 40 Mbps that 6 MB bought at 0.3 MB of headroom.
+// (That direct run also had diagnostics ON, so a 64 KiB-sampled heap plus a
+// late-profile STW dump at 46.4 MB were adding overhead on top of the window;
+// the window cut is the primary lever, diagnostics-off is secondary.)
 // Judge the REAL footprint from a direct run (no debugger) via the tunnel log's
 // footprint-peak, never from an Xcode EXC_RESOURCE. The stream ceiling is half
 // the connection ceiling, preserving quic-go's own ratio.
 //
 // Initial windows are NOT left alone: callers (tuic, shadowquic, hysteria)
 // pre-fill Initial = Default/10 = 6.4 MB for the 64 MB default, which is ABOVE
-// this 6 MB Max ceiling. applyQUICWindowCeilingForGOOS clamps Initial down to
+// this 4 MB Max ceiling. applyQUICWindowCeilingForGOOS clamps Initial down to
 // Max so the advertised initial window cannot punch through the cap.
 const (
-	mobileMaxConnectionReceiveWindow = 6 * 1024 * 1024
-	mobileMaxStreamReceiveWindow     = 3 * 1024 * 1024
+	mobileMaxConnectionReceiveWindow = 4 * 1024 * 1024
+	mobileMaxStreamReceiveWindow     = 2 * 1024 * 1024
 )
 
 // applyPlatformQUICWindowCeiling bounds the receive windows on platforms with a

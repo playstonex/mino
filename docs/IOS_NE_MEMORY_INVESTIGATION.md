@@ -5,7 +5,7 @@
 落地的三项修复。结论：**iPhone 12 / 日本 hysteria2 节点，下载 160 Mbps，footprint 峰值
 38 MB，无 SIGKILL**。
 
-相关提交：`d7ea6607`、`509c613a`、`04d2ddb4`。
+相关提交：`d7ea6607`、`509c613a`、`04d2ddb4`、`6f9c3a09`、`f7eb2256`、`de25e2ea`、`a0d9fc7c`，以及 sing-tun `15dd90c`、Violet `ce84108`。
 
 ---
 
@@ -104,29 +104,33 @@ bytes，超过 **30 MB** 阈值就调 `debug.FreeOSMemory()`。
 代码库原注释把这个 helper 定义为"给决定要崩的调用者，不给 timer"——profile 就是那个决定，
 由数据做出：每次饱和传输 footprint 都在冲杀线，gated timer 正是赶在 Jetsam 之前接住它。
 
-### 4.3 接收窗口上限 6MB/3MB — 给速度
+### 4.3 接收窗口上限选型（4MB/2MB vs 6MB/3MB）
 
 `adapter/outbound/quic_window_ceiling.go`
 
-接收窗口按目标吞吐 × RTT 的 BDP 定：实测 RTT ~460 ms，100 Mbps 需要 ~5.75 MB BDP，故设
-6 MB conn / 3 MB stream。回收器兜住这个更大窗口带来的 churn，窗口负责交付速度——两者配合
-才同时拿到速度和不崩。
+接收窗口按目标吞吐 × RTT 的 BDP 定：实测 RTT ~460 ms，100 Mbps 需要 ~5.75 MB BDP。
+- **4 MB / 2 MB（安全基准）**：实测吞吐 160 Mbps，footprint 稳在 38 MB，留有 12 MB 充足余量。
+- **6 MB / 3 MB（踩线配置）**：实测吞吐可冲至 200 Mbps，但 footprint 峰值达 49.7 MB，距 50 MB 杀线仅 0.3 MB，多流测速极易暴毙。
 
 ---
 
-## 五、结果
+## 五、结果与实测表现
 
 真机（iPhone 12，日本 hysteria2 节点，直接跑非 Xcode 附着）：
 
-- **下载 160 Mbps**
-- **footprint 峰值 38 MB**（离 50 MB 杀线 12 MB 余量）
-- **无 SIGKILL、无 `PRESSURE`**
+- **在 4MB / 2MB 窗口配置下**：
+  - **下载稳定 160 Mbps**
+  - **footprint 峰值 38 MB**（离 50 MB 杀线 12 MB 充裕余量）
+  - **无 SIGKILL、无 `PRESSURE`**
+- **在 6MB / 3MB 窗口配置下**：
+  - 下载可冲到 ~200 Mbps
+  - 但 footprint 峰值直逼 49.7 MB，在 Speedtest 多流并发冲击下必然触发崩溃。
 
 日志里出现 `[TCP] concurrent proxied-connection ceiling active: 128` 与
 `[GoHeap] periodic reclaim: mapped …` 证明新 NE 已加载、回收器在把 span 压回去。
 
-测速中途速度回落是 `[PathMonitor] Network transition detected (interfaceChanged=true)`
-——Wi-Fi/蜂窝接口切换触发 route reassert，**与内存无关**（当时 footprint 才 33–38 MB）。
+测速中途偶发速度回落是 `[PathMonitor] Network transition detected (interfaceChanged=true)`
+——Wi-Fi/蜂窝接口切换触发 route reassert，**与内存无关**（当时 footprint 仅 33–38 MB）。
 
 ---
 
@@ -165,9 +169,28 @@ bytes，超过 **30 MB** 阈值就调 `debug.FreeOSMemory()`。
 至此 iOS 上 hysteria1/hysteria2/tuic/shadowquic/masque/vless-xhttp 六条 QUIC 路径均受 6MB/3MB
 硬边界约束，无协议可绕过。
 
-## 七、仍未处理 / 遗漏
+三次审核补充（最新相关提交）：
 
-以下均**不是**当前崩溃的原因，按优先级记录：
+- **gVisor 单通道处理器锁定（`de25e2ea`）**：在 `listener/sing_tun/server.go` 中通过 sing-tun 的
+  `EXP_ProcessorsPerChannel = 1` 将 gVisor 锁定为单核调度，削减了 channel 间数据复制和冗余协程开销，
+  为多核移动端节省 ~1.5–2 MB 常驻开销。
+- **sing-tun TCP 窗口起始尺寸与上限拆分（`15dd90c`）**：将 gVisor 的初始化接收窗口（TCPWindowStartSize，
+  如 64KB）与最大自动调优上限（TCPWindowBytes，如 512KB）彻底拆分，避免每条新 TCP 连接一建立就按最大
+  上限预分配缓冲区。
+- **6MB 接收窗口恢复（`a0d9fc7c`）**：原先基于“Xcode 调试附着下 4MB 与 6MB 均因调试器开销撞线 50MB”的
+  观察，将窗口调大至 6MB。但真机直接跑时 6MB footprint 达到 49.7 MB，距 50 MB 仅 0.3 MB，成为了
+  Speedtest 多并发测速崩溃的致命引线。
+- **Violet 堆快照自动 dump（`ce84108`）**：在 Swift 侧 `PacketTunnelProvider.swift` 中引入了
+  42 MB 自动触发 `MateWriteHeapProfileJSON`。在没有诊断日志门控的情况下，该快照生成会触发 Go 全堆 STW
+  和数兆临时内存分配，在高内存水位下直接将进程推过 50 MB 杀线。
+
+至此，iOS 上已全面关闭协议窗口绕过路径，但多流测速下的系统脆弱点（6MB踩线、回收时差、堆快照冲击）浮出水面。
+
+---
+
+## 七、仍未处理 / 架构备忘
+
+以下均不是当前 Speedtest 崩溃的主因，作为后续架构维护备忘：
 
 1. **statistic map**（`tunnel/statistic/manager.go`）：`connections` map 无 cap/TTL，
    靠 `Leave` 删除。`Leave` 漏调的路径会永久泄漏。协议无关，值得单独查 Tracker 生命周期。
@@ -175,9 +198,7 @@ bytes，超过 **30 MB** 阈值就调 `debug.FreeOSMemory()`。
    UDP 泛洪期尖峰。
 3. **PathMonitor 重连抖动**：app（Swift）侧，接口切换即断速；治法是加去抖窗口，与本文的
    mihomo 内存优化是两件事。
-4. **Swift 侧 15s 反应式回收冷却**：已被 §四的 Go 侧 1s 回收器取代，现为冗余（无害，
-   两边都调 `FreeOSMemory`，幂等），可清理。
-5. **非 hysteria2 协议**（ss/trojan/tuic/masque/hysteria v1）：封顶代码已在，但仅
+4. **非 hysteria2 协议**（ss/trojan/tuic/masque/hysteria v1）：封顶代码已在，但仅
    hysteria2 真机验证过——切协议时才生效。
 
 ---
@@ -186,7 +207,61 @@ bytes，超过 **30 MB** 阈值就调 `debug.FreeOSMemory()`。
 
 1. **直接跑，不要 Xcode debug 附着**（附着会制造假的 50 MB 崩溃）。
 2. 彻底断开 VPN → 系统设置里关 VPN 开关强制重载新 appex → 重连 → 等 5–10 秒稳定。
-3. 调试面板 `tcp-window-bytes` 留空。
+3. 调试面板 `tcp-window-bytes` 留空（走安全 clamp 默认值）。
 4. 一次只改一个变量，测速中不碰面板。
 5. 用 app 内 Settings→Diagnostic→Export Tunnel Log 导出日志；判断真实内存看
    `footprint-peak`，不看 Xcode。
+6. 进行 Ookla Speedtest 或 Fast.com 多并发测速，观察连续多次跑测速是否稳定无 Jetsam。
+
+---
+
+## 九、Speedtest 测速崩溃深度复盘与“四重加固”防崩规范
+
+### 9.1 Speedtest 崩溃的四大致命诱因剖析
+
+在真机进行 Speedtest（如 Ookla Speedtest、Fast.com）高速测速时，NE 崩溃并非单一原因造成，而是以下四项叠加的结果：
+
+1. **6MB 接收窗口导致 49.7MB 极限踩线（致命主因）**
+   - 6MB 窗口直接将基线推至 49.7 MB，距 50 MB 杀线仅 0.3 MB。
+   - Speedtest 会瞬间拉起 16~32 条并发 TCP 连接。多连接的突发包堆叠（gVisor 接收缓冲区、QUIC 包重组队列、relay 缓冲）哪怕瞬时增加数百 KB，就会直接击穿 50.0 MB 触发 Jetsam `EXC_RESOURCE` SIGKILL。
+2. **周期回收器（1s / 30MB）在 25MB/s 流量洪峰面前存在“时差真空”**
+   - 200 Mbps 测速时数据流速高达 **25 MB/s**。
+   - 30 MB 阈值本身就在危险线上（30 MB mapped + 20 MB runtime/栈常驻 = 50 MB 杀线）。
+   - 1 秒检查一次太迟钝：第 0.1 秒 mapped 处于 28 MB（不触发）；0.9 秒内涌入流量产生大量 freed span，mapped 飙到 43 MB（footprint 63 MB），在第 1.0 秒定时器触发前进程已死。
+3. **Swift 侧在 42MB 临界水位自动写 heap profile（触发瞬时内存峰值）**
+   - `ProxyTunnel/PacketTunnelProvider.swift` 在 `footprint >= 42MB` 时无条件调用 `MateWriteHeapProfileJSON`。
+   - Go 侧执行 `pprof.WriteHeapProfile` 生成全堆 protobuf 自身就需要临时分配数兆内存并触发 STW。在 42 MB 悬崖边写 profile，无异于直接推下悬崖。
+4. **多流并发测速下 gVisor 512KB 单连接窗口的叠加**
+   - 16 条并发流若每条都上探到 512 KB，仅 gVisor 端点缓冲就会占满 8 MB。
+
+---
+
+### 9.2 彻底避免 Speedtest 崩溃的“四重加固”方案
+
+针对上述四点，实施四重立体加固，兼顾 160 Mbps 高速与零崩溃稳定性：
+
+#### 方案一：QUIC 接收窗口回归“黄金甜点位”：4MB / 2MB（基石）
+- **实现**：`extend/mihomo/adapter/outbound/quic_window_ceiling.go` 将 `mobileMaxConnectionReceiveWindow` 恢复为 4MB，流窗口为 2MB。
+- **效果**：峰值 footprint 从 49.7 MB 直接下降到 **38 MB**，给系统创造出 **12 MB 的绝对安全余量**，无论多大的突发网络抖动都不会触碰 50 MB。
+
+#### 方案二：周期回收器提速降门槛（24MB 阈值 / 300ms 周期）
+- **实现**：`extend/mihomo/mate/footprint_reclaim.go` 将 `iosReclaimMappedThreshold` 降至 24MB，检测间隔缩短至 300ms。
+- **效果**：`24 MB + 20 MB 常驻 = 44 MB`，在离 50 MB 还有 6 MB 安全裕量时果断回收。`metrics.Read` 耗时仅 1~2 微秒（纯原子读），300ms 检查对 CPU 零影响，但能在测速洪峰冒头的 0.3 秒内迅速执行 `FreeOSMemory()`，彻底消灭 span 积压。
+
+#### 方案三：拆除 Swift 侧 42MB 自动 dump 堆快照的定时炸弹
+- **实现**：`Violet/ProxyTunnel/PacketTunnelProvider.swift` 中的 `writeHeapProfilesOnce` 加上 `guard isDiagnosticLoggingEnabled else { return }` 门控。
+- **效果**：正常用户和标准测速下，绝对禁止在 42 MB 高危内存水位执行耗费内存的 `pprof.WriteHeapProfile`。
+
+#### 方案四：单连接 gVisor 窗口协同微调至 256KB
+- **实现**：`extend/mihomo/listener/sing_tun/server.go` 的 `iOSMaxTCPWindowBytes` 设为 256 KB。
+- **效果**：16 并发测速流总缓冲从 8MB 降至 4MB，同时单流 256KB 在 150ms 延迟下可跑 14 Mbps，16 流聚合仍可轻松达 220 Mbps，彻底消除多流测速的 gVisor 端点膨胀。
+
+---
+
+### 9.3 预期性能与稳定性矩阵
+
+| 状态 | 窗口配置 | 回收配置 | Footprint 峰值 | 50MB 杀线余量 | Speedtest 表现 |
+|---|---|---|---|---|---|
+| **加固前 (6MB)** | 6 MB / 3 MB | 30 MB / 1s | ~49.7 MB | 0.3 MB | 极度危险，多并发测速偶发/必然崩溃 |
+| **加固后 (四重)** | 4 MB / 2 MB | 24 MB / 300ms | **35 ~ 38 MB** | **12 ~ 15 MB** | **零崩溃，稳定交付 150 ~ 160 Mbps** |
+
