@@ -270,10 +270,19 @@ func StopOverlay() error {
 
 // MateGetOverlaySnapshotJSON returns the current overlay state for UI display.
 // The returned JSON matches Swift's OverlaySnapshot schema exactly.
-// Returns "{}" when overlay is not running (proxy-only mode).
+//
+// When the overlay is not yet running (registration in flight, proxy-only mode,
+// or a failed/torn-down session) it returns a schema-COMPLETE snapshot with
+// connectionMode "disconnected" and empty peers — NOT "{}". A bare "{}" decodes
+// to a keyNotFound error on the Swift side (all OverlaySnapshot keys are
+// non-optional), which the LAN Devices view surfaced as the misleading
+// "The data couldn't be read because it is missing." alert.
 func GetOverlaySnapshotJSON() string {
 	if globalOverlayManager == nil || !globalOverlayManager.running.Load() {
-		return "{}"
+		if globalOverlayManager != nil {
+			return globalOverlayManager.NotReadySnapshotJSON()
+		}
+		return emptyOverlaySnapshotJSON()
 	}
 	return globalOverlayManager.SnapshotJSON()
 }

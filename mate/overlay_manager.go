@@ -420,21 +420,26 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 	resolvedRelay := normalizeRelayEndpoint(resolveRelayEndpoint(regResult.RelayEndpoint, cfg.ServerURL))
 	m.logf("[Overlay-Go] Relay endpoint from registration: raw=%q resolved=%q", regResult.RelayEndpoint, resolvedRelay)
 
-	// 7a. Try multi-region relay selection if bootstrap URL is available
-	relayServers := m.fetchRelayServers()
-	if len(relayServers) > 0 {
-		m.mu.Lock()
-		m.relayServers = relayServers
-		m.mu.Unlock()
-		selectedRelay := m.selectBestRelay(relayServers, resolvedRelay)
-		if selectedRelay != "" {
-			resolvedRelay = selectedRelay
-		}
-	} else if regResult.RelayRegion != "" {
+	// 7a. Multi-region relay selection is an OPTIONAL optimization that hits the
+	// bootstrap API (linklink.playstone.info, behind Cloudflare). On some
+	// networks that host is slow/reset, and because MateStartOverlay is called
+	// synchronously by the NE, a blocking fetch here stalled overlay startup for
+	// the full HTTP timeout — pushing past the app-side connect deadline, which
+	// then issued stopTunnel(reason=1). Start with the registration relay
+	// endpoint immediately (it always works — registration just succeeded) and
+	// refine to a better region in the background if the API is reachable.
+	if regResult.RelayRegion != "" {
 		m.mu.Lock()
 		m.relayRegion = regResult.RelayRegion
 		m.mu.Unlock()
 	}
+	// NOTE: the background refinement itself is dispatched at step 12, after
+	// running.Store(true). Dispatching it here raced its own `m.running` guard —
+	// on a fast network fetchRelayServers() returned in a few hundred ms, while
+	// running was still false, so the goroutine returned early and multi-region
+	// selection silently never happened. It also risked the reverse order, where
+	// the better relay it picked was immediately overwritten by the synchronous
+	// Configure() below.
 
 	if err := globalOverlayTransport.Configure(resolvedRelay, cfg.AccessToken, m.deviceID); err != nil {
 		m.logf("[Overlay-Go] Warning: overlay transport configure failed: %v", err)
@@ -460,11 +465,49 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 	m.configureICEServers()
 
 	// 11. Wire P2P callbacks directly (no Swift round-trip)
+	m.logf("[Overlay-Go] Wiring P2P callbacks")
 	m.wireP2PCallbacks()
+	m.logf("[Overlay-Go] P2P callbacks wired")
 
 	// 12. Mark running and start goroutines
 	m.running.Store(true)
 	m.cancelCh = make(chan struct{})
+
+	// 12a. Refine the relay endpoint in the background, now that running is true.
+	// Optional optimization: it hits the bootstrap API behind Cloudflare, which on
+	// some networks is slow or reset, so it must never be on the synchronous
+	// MateStartOverlay path — a blocking fetch here stalled overlay startup past
+	// the app-side connect deadline, which then issued stopTunnel(reason=1).
+	go func(fallback, accessToken, deviceID string) {
+		relayServers := m.fetchRelayServers()
+		if len(relayServers) == 0 {
+			return
+		}
+		if !m.running.Load() {
+			return
+		}
+		m.mu.Lock()
+		m.relayServers = relayServers
+		m.mu.Unlock()
+		selectedRelay := m.selectBestRelay(relayServers, fallback)
+		if selectedRelay == "" || selectedRelay == fallback {
+			return
+		}
+		// Re-check: probing latency across regions takes time, and the tunnel may
+		// have stopped meanwhile. Configure() on a stopped overlay would revive a
+		// relay for a torn-down manager.
+		if !m.running.Load() {
+			return
+		}
+		if err := globalOverlayTransport.Configure(selectedRelay, accessToken, deviceID); err != nil {
+			m.logf("[Relay-Select] Background relay switch failed: %v", err)
+			return
+		}
+		m.mu.Lock()
+		m.relayEndpoint = selectedRelay
+		m.mu.Unlock()
+		m.logf("[Relay-Select] Switched to better relay in background: %s", selectedRelay)
+	}(resolvedRelay, cfg.AccessToken, m.deviceID)
 
 	// Enable per-packet debug logging for the first 30 seconds after start.
 	m.debugPacketLog.Store(true)
@@ -475,15 +518,18 @@ func (m *OverlayManager) Start(configJSON string, platform PlatformInterface) er
 	}()
 
 	// 13. Start signaling poll loop
+	m.logf("[Overlay-Go] Starting signaling loop")
 	m.wg.Add(1)
 	go m.signalingLoop()
 
 	// 14. Start TUN fd reader (overlay-only mode)
 	if cfg.Mode == "overlay" && cfg.TunnelFd > 0 {
+		m.logf("[Overlay-Go] Starting TUN read loop")
 		m.wg.Add(1)
 		go m.tunReadLoop()
 	}
 
+	m.logf("[Overlay-Go] Start() complete, returning to Swift")
 	started = true
 	return nil
 }
@@ -680,14 +726,53 @@ func (m *OverlayManager) SnapshotJSON() string {
 
 	data, err := json.Marshal(snap)
 	if err != nil {
-		return "{}"
+		// A marshal failure must still return a schema-complete document,
+		// not "{}", or the Swift OverlaySnapshot decode throws keyNotFound.
+		return emptyOverlaySnapshotJSON()
 	}
 	return string(data)
 }
 
-// ---------------------------------------------------------------------------
-// Crypto — key derivation, encryption, decryption
-// ---------------------------------------------------------------------------
+// NotReadySnapshotJSON returns a schema-complete OverlaySnapshot describing an
+// overlay that is not yet running: registration still in flight, proxy-only
+// mode, or a torn-down session. It carries whatever config context is already
+// known (mode, server, LAN id) so the UI can label the group, sets
+// connectionMode "disconnected", and reports zero peers. It NEVER returns "{}".
+func (m *OverlayManager) NotReadySnapshotJSON() string {
+	m.mu.RLock()
+	var mode, serverURL, lanID string
+	if m.config != nil {
+		mode = m.config.Mode
+		serverURL = m.config.ServerURL
+		lanID = m.config.LanID
+	}
+	deviceID := m.deviceID
+	overlayIP := m.overlayIP
+	m.mu.RUnlock()
+
+	snap := overlaySnapshot{
+		Mode:           mode,
+		ServerURL:      serverURL,
+		LanID:          lanID,
+		DeviceID:       deviceID,
+		OverlayIP:      overlayIP,
+		PeerCount:      0,
+		PeerIDs:        []string{},
+		ConnectionMode: "disconnected",
+		Peers:          []overlayPeerInfo{},
+	}
+	data, err := json.Marshal(snap)
+	if err != nil {
+		return emptyOverlaySnapshotJSON()
+	}
+	return string(data)
+}
+
+// emptyOverlaySnapshotJSON is the last-resort schema-complete document used when
+// there is no manager at all or marshaling fails. Hand-built so it cannot fail.
+func emptyOverlaySnapshotJSON() string {
+	return `{"mode":"","serverUrl":"","lanId":"","deviceId":"","overlayIp":"","peerCount":0,"peerIds":[],"connectionMode":"disconnected","peers":[]}`
+}
 
 // deriveSharedKey performs X25519 ECDH and HKDF-SHA256 to derive a shared
 // symmetric key from the local private key and a peer's public key.
@@ -1211,7 +1296,7 @@ func (m *OverlayManager) fetchRelayServers() []relayServerEntry {
 	}
 	req.Header.Set("Authorization", "Bearer "+m.config.AccessToken)
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		m.logf("[Relay-Select] Failed to fetch relay servers: %v", err)

@@ -14,6 +14,19 @@ var globalOverlayTransport = newOverlayTransportManager()
 type overlayTransportManager struct {
 	mu sync.RWMutex
 
+	// relayCreateMu serializes relay-client creation so a slow, blocking
+	// NewRelayClient dial (DNS + 5s register deadline) runs without holding
+	// `mu`. Holding `mu` across that dial blocked SetPacketHandler/RegisterPeer
+	// during overlay startup and left NEVPNStatus stuck at "Connecting".
+	relayCreateMu sync.Mutex
+
+	// configEpoch is bumped by every Configure() that changes the relay config
+	// and by Reset(). ensureRelay() snapshots it before its unlocked dial and
+	// re-checks it before storing the result, so a slow dial (up to ~5s) cannot
+	// resurrect a relay client for a superseded endpoint or for an already
+	// torn-down manager.
+	configEpoch uint64
+
 	platform      PlatformInterface
 	relayEndpoint string
 	accessToken   string
@@ -69,6 +82,7 @@ func (m *overlayTransportManager) Reset() {
 	m.relayEndpoint = ""
 	m.accessToken = ""
 	m.localDeviceID = ""
+	m.configEpoch++
 	m.peers = make(map[string]struct{})
 	m.packetHandler = nil
 	m.relayFailCount = 0
@@ -138,6 +152,13 @@ func (m *overlayTransportManager) Configure(relayEndpoint string, accessToken st
 		_ = m.relayClient.Close()
 		m.relayClient = nil
 	}
+	if configChanged {
+		// Invalidate any dial already in flight for the previous endpoint so it
+		// cannot overwrite this config when it eventually returns.
+		m.configEpoch++
+		m.relayFailCount = 0
+		m.relayLastFail = time.Time{}
+	}
 
 	m.mu.Unlock()
 
@@ -145,11 +166,23 @@ func (m *overlayTransportManager) Configure(relayEndpoint string, accessToken st
 		return nil
 	}
 
-	if _, err := m.ensureRelay(); err != nil {
-		return err
-	}
-
-	m.logf("[OverlayTransport] relay ready for local device %s via %s", localDeviceID, relayEndpoint)
+	// Do NOT synchronously establish the relay here. p2p.NewRelayClient dials
+	// and handshakes the relay endpoint, and on networks where that endpoint is
+	// unreachable it blocks — and because Configure() is on the synchronous
+	// MateStartOverlay -> Start() path, that stall kept the NE from ever
+	// returning from startTunnel, so NEVPNStatus was stuck at "Connecting"
+	// forever even though the overlay TUN was already up. The relay is only
+	// needed as a FALLBACK transport for actual peer traffic; Send()/ensureRelay()
+	// create it lazily on first use (with backoff). Establish it in the
+	// background so a reachable relay is ready ahead of time, without blocking
+	// startup on an unreachable one.
+	go func() {
+		if _, err := m.ensureRelay(); err != nil {
+			m.logf("[OverlayTransport] background relay setup deferred: %v", err)
+			return
+		}
+		m.logf("[OverlayTransport] relay ready for local device %s via %s", localDeviceID, relayEndpoint)
+	}()
 	return nil
 }
 
@@ -207,19 +240,24 @@ func (m *overlayTransportManager) Send(peerID string, payload []byte) error {
 		}
 	}
 
-	// C1 fix: hold RLock during both packetConn lookup AND WriteTo to prevent
-	// readLoop from closing the conn between lookup and write.
+	// Take a reference to the direct packet channel and RELEASE the lock before
+	// writing. An earlier "C1 fix" held RLock across WriteTo so readLoop could not
+	// close the conn between lookup and write — but that put network I/O inside the
+	// critical section, which is the same anti-pattern that deadlocked overlay
+	// startup (a lock held across a blocking call starves every writer:
+	// SetPacketHandler, Configure, Reset). It is also unnecessary: writing to a
+	// conn another goroutine just closed returns an error, it does not panic, and
+	// that error is exactly the signal to fall through to the relay below.
 	m.mu.RLock()
 	conn := m.packetConns[peerID]
+	m.mu.RUnlock()
 	if conn != nil {
-		_, err := conn.WriteTo(payload, &net.UDPAddr{})
-		m.mu.RUnlock()
-		if err == nil {
+		// addr is ignored: every conn attached here is a *p2p.PacketDataChannelConn
+		// whose WriteTo sends on the WebRTC DataChannel and discards the address.
+		if _, err := conn.WriteTo(payload, nil); err == nil {
 			return nil
 		}
-		// direct send failed, fall through to relay
-	} else {
-		m.mu.RUnlock()
+		// direct send failed (closed conn, DataChannel down) — fall through to relay
 	}
 
 	relayClient, err := m.ensureRelay()
@@ -231,9 +269,6 @@ func (m *overlayTransportManager) Send(peerID string, payload []byte) error {
 	return relayClient.SendToPeer(peerID, payload)
 }
 
-// packetConn is no longer used — Send() now holds RLock during lookup+write (C1).
-// Kept as unexported for potential future use.
-
 func (m *overlayTransportManager) ensureRelay() (*p2p.RelayClient, error) {
 	// Fast path: relay already exists
 	m.mu.RLock()
@@ -244,40 +279,58 @@ func (m *overlayTransportManager) ensureRelay() (*p2p.RelayClient, error) {
 	}
 	m.mu.RUnlock()
 
-	// Slow path: need to create relay. Use write lock for the entire creation
-	// to prevent concurrent Send() calls from creating duplicate clients (C1).
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Slow path. p2p.NewRelayClient does a DNS resolve + a register() with a
+	// 5s read deadline, so it can block for seconds when the relay endpoint is
+	// unreachable. We must NOT hold m.mu across it: SetPacketHandler(),
+	// RegisterPeer(), logf() and Send() all take m.mu, and blocking them for
+	// 5s during startup was exactly what stalled wireP2PCallbacks ->
+	// SetPacketHandler, kept MateStartOverlay from returning, and left
+	// NEVPNStatus stuck at "Connecting". Serialize creation with a dedicated
+	// mutex instead, and only touch m.mu for the brief snapshot and store.
+	m.relayCreateMu.Lock()
+	defer m.relayCreateMu.Unlock()
 
-	// Double-check after acquiring write lock
+	// Double-check: another creator may have finished while we waited.
+	m.mu.RLock()
 	if m.relayClient != nil {
-		return m.relayClient, nil
+		relayClient := m.relayClient
+		m.mu.RUnlock()
+		return relayClient, nil
 	}
-
-	// H2: Exponential backoff on relay creation failures
-	if m.relayFailCount > 0 && !m.relayLastFail.IsZero() {
-		backoff := time.Duration(1<<min(m.relayFailCount-1, 6)) * time.Second // 1s, 2s, 4s, ... 64s
-		if time.Since(m.relayLastFail) < backoff {
-			return nil, fmt.Errorf("relay creation in backoff (%v remaining)", backoff-time.Since(m.relayLastFail))
-		}
-	}
-
 	relayEndpoint := m.relayEndpoint
 	accessToken := m.accessToken
 	localDeviceID := m.localDeviceID
+	epoch := m.configEpoch
+	failCount := m.relayFailCount
+	lastFail := m.relayLastFail
 	peerIDs := make([]string, 0, len(m.peers))
 	for peerID := range m.peers {
 		peerIDs = append(peerIDs, peerID)
+	}
+	m.mu.RUnlock()
+
+	// H2: Exponential backoff on relay creation failures
+	if failCount > 0 && !lastFail.IsZero() {
+		backoff := time.Duration(1<<min(failCount-1, 6)) * time.Second // 1s, 2s, 4s, ... 64s
+		if time.Since(lastFail) < backoff {
+			return nil, fmt.Errorf("relay creation in backoff (%v remaining)", backoff-time.Since(lastFail))
+		}
 	}
 
 	if relayEndpoint == "" || accessToken == "" || localDeviceID == "" {
 		return nil, fmt.Errorf("overlay relay is not configured")
 	}
 
+	// Blocking dial + register happens WITHOUT m.mu held.
 	relayClient, err := p2p.NewRelayClient(relayEndpoint, accessToken, localDeviceID, m.buildSocketProtector())
 	if err != nil {
-		m.relayFailCount++
-		m.relayLastFail = time.Now()
+		m.mu.Lock()
+		// Only record the failure against the config it actually belongs to.
+		if m.configEpoch == epoch {
+			m.relayFailCount++
+			m.relayLastFail = time.Now()
+		}
+		m.mu.Unlock()
 		return nil, err
 	}
 
@@ -288,15 +341,33 @@ func (m *overlayTransportManager) ensureRelay() (*p2p.RelayClient, error) {
 	for _, peerID := range peerIDs {
 		if err := relayClient.AddPeer(peerID); err != nil {
 			_ = relayClient.Close()
-			m.relayFailCount++
-			m.relayLastFail = time.Now()
+			m.mu.Lock()
+			if m.configEpoch == epoch {
+				m.relayFailCount++
+				m.relayLastFail = time.Now()
+			}
+			m.mu.Unlock()
 			return nil, err
 		}
 	}
 
+	m.mu.Lock()
+	// The dial ran unlocked and may have taken seconds. If Configure() re-pointed
+	// the relay or Reset() tore the manager down meanwhile, this client belongs to
+	// a config that no longer exists: discard it instead of resurrecting a stale
+	// endpoint (and, after Reset, a dispatch path into a destroyed handler).
+	if m.configEpoch != epoch {
+		m.mu.Unlock()
+		_ = relayClient.Close()
+		return nil, fmt.Errorf("overlay relay config changed during dial; discarded stale client for %s", relayEndpoint)
+	}
+	// Another creator winning the race is not possible here (relayCreateMu is
+	// still held), but Reset() could have nil'd the field without bumping past
+	// our epoch check — keep the store unconditional and epoch-gated.
 	m.relayClient = relayClient
 	m.relayFailCount = 0
 	m.relayLastFail = time.Time{}
+	m.mu.Unlock()
 	return relayClient, nil
 }
 
