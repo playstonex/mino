@@ -21,8 +21,25 @@ if [ -d "$HOME/Library/Android/sdk" ]; then
 else
     ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}"
 fi
-ANDROID_NDK_VERSION="25.2.9519653"
-ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+# Android NDK path (auto-detect or set manually)
+if [ -z "$ANDROID_NDK_ROOT" ]; then
+    if [ -n "$ANDROID_NDK_VERSION" ] && [ -d "$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION" ]; then
+        ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+    elif [ -d "$ANDROID_SDK_ROOT/ndk/25.2.9519653" ]; then
+        ANDROID_NDK_VERSION="25.2.9519653"
+        ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/$ANDROID_NDK_VERSION"
+    elif [ -d "$ANDROID_SDK_ROOT/ndk" ]; then
+        ANDROID_NDK_ROOT=$(ls -1d "$ANDROID_SDK_ROOT/ndk"/* 2>/dev/null | sort -V | tail -n 1)
+        ANDROID_NDK_VERSION=$(basename "$ANDROID_NDK_ROOT")
+    fi
+fi
+export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+
+if [ -z "$JAVA_HOME" ] && [ -d "$HOME/jdk-21.0.7+6/Contents/Home" ]; then
+    export JAVA_HOME="$HOME/jdk-21.0.7+6/Contents/Home"
+    export PATH="$JAVA_HOME/bin:$PATH"
+fi
+
 ANDROID_MIN_SDK=21
 
 # Colors
