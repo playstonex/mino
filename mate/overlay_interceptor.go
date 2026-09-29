@@ -50,6 +50,7 @@ func (m *OverlayManager) InterceptPacket(destination netip.Addr, packet []byte) 
 	}
 
 	packet = rewriteHybridOverlaySource(packet, localIP)
+	packet = clampTCPMSS(packet, overlayMaxTCPMSS)
 
 	encrypted, err := m.encryptPacket(packet, peerCipher)
 	if err != nil {
@@ -281,6 +282,80 @@ func replaceChecksumIPv4Source(checksum uint16, oldSource [4]byte, newSource [4]
 		sum = (sum & 0xffff) + (sum >> 16)
 	}
 	return ^uint16(sum)
+}
+
+// overlayMaxTCPMSS caps the TCP MSS negotiated across the overlay so that a
+// full-size segment still fits the relay path after encryption and framing:
+// 1160 MSS + 40 IP/TCP + 28 AES-GCM + 34 relay header = 1262 bytes of UDP
+// payload, well under both the relay client read buffer and a 1500-byte
+// public-internet path MTU (no IP fragmentation, which Chinese carriers/NATs
+// often drop). Direct WebRTC paths fragment on their own via SCTP, but relay
+// does not, so hybrid mode's 1500 TUN MTU otherwise breaks SSH KEX over relay.
+const overlayMaxTCPMSS = 1160
+
+// clampTCPMSS lowers the MSS option of an IPv4 TCP SYN / SYN-ACK to maxMSS and
+// recomputes the TCP checksum. Any other packet is returned untouched. It is
+// applied to both outbound and inbound overlay packets, so a single upgraded
+// endpoint is enough to keep both directions under the cap.
+func clampTCPMSS(packet []byte, maxMSS uint16) []byte {
+	if len(packet) < 20 || packet[0]>>4 != 4 || packet[9] != 6 {
+		return packet
+	}
+	headerLen := int(packet[0]&0x0f) * 4
+	if headerLen < 20 || len(packet) < headerLen+20 {
+		return packet
+	}
+	// SYNs are never fragmented in practice; skip any fragment rather than
+	// computing a checksum over a partial segment.
+	if binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
+		return packet
+	}
+	totalLen := int(binary.BigEndian.Uint16(packet[2:4]))
+	if totalLen == 0 || totalLen > len(packet) {
+		totalLen = len(packet)
+	}
+	tcp := packet[headerLen:totalLen]
+	if len(tcp) < 20 || tcp[13]&0x02 == 0 { // SYN flag
+		return packet
+	}
+	dataOffset := int(tcp[12]>>4) * 4
+	if dataOffset <= 20 || dataOffset > len(tcp) {
+		return packet
+	}
+
+	opts := tcp[20:dataOffset]
+	changed := false
+	for i := 0; i < len(opts); {
+		kind := opts[i]
+		if kind == 0 { // end of option list
+			break
+		}
+		if kind == 1 { // NOP
+			i++
+			continue
+		}
+		if i+1 >= len(opts) {
+			break
+		}
+		optLen := int(opts[i+1])
+		if optLen < 2 || i+optLen > len(opts) {
+			break
+		}
+		if kind == 2 && optLen == 4 { // MSS
+			if binary.BigEndian.Uint16(opts[i+2:i+4]) > maxMSS {
+				binary.BigEndian.PutUint16(opts[i+2:i+4], maxMSS)
+				changed = true
+			}
+		}
+		i += optLen
+	}
+	if !changed {
+		return packet
+	}
+
+	tcp[16], tcp[17] = 0, 0
+	binary.BigEndian.PutUint16(tcp[16:18], ipv4TransportChecksum(6, packet[12:16], packet[16:20], tcp))
+	return packet
 }
 
 func internetChecksum(data []byte) uint16 {

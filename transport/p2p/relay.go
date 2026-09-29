@@ -171,7 +171,7 @@ func (r *RelayClient) register() error {
 	}
 
 	// Wait for register ack.
-	buf := make([]byte, 1500)
+	buf := make([]byte, relayReadBufferSize)
 	for {
 		n, _, err := r.conn.ReadFrom(buf)
 		if err != nil {
@@ -193,9 +193,14 @@ func (r *RelayClient) register() error {
 	}
 }
 
+// relayReadBufferSize matches the relay server's MaxPacketSize (2048). A 1500
+// buffer silently truncated full-MTU encrypted packets (1500 + 28 GCM + 34
+// header), which then failed AES-GCM authentication on the receiver.
+const relayReadBufferSize = 2048
+
 func (r *RelayClient) receiveLoop() {
 	defer close(r.done)
-	buf := make([]byte, 1500)
+	buf := make([]byte, relayReadBufferSize)
 	for {
 		n, _, err := r.conn.ReadFrom(buf)
 		if err != nil {

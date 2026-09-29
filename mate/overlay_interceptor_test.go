@@ -73,3 +73,55 @@ func buildIPv4TCPPacket(source [4]byte, destination [4]byte, payload []byte) []b
 
 	return packet
 }
+
+// buildIPv4TCPSyn builds a SYN whose options are NOP, NOP, MSS(mss), so the
+// MSS option sits at a non-4-aligned offset inside the option block.
+func buildIPv4TCPSyn(source, destination [4]byte, mss uint16) []byte {
+	const ipHeaderLen, tcpHeaderLen = 20, 28
+	packet := make([]byte, ipHeaderLen+tcpHeaderLen)
+	packet[0] = 0x45
+	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
+	packet[8] = 64
+	packet[9] = 6
+	copy(packet[12:16], source[:])
+	copy(packet[16:20], destination[:])
+
+	tcp := packet[ipHeaderLen:]
+	binary.BigEndian.PutUint16(tcp[0:2], 54321)
+	binary.BigEndian.PutUint16(tcp[2:4], 22)
+	tcp[12] = (tcpHeaderLen / 4) << 4
+	tcp[13] = 0x02 // SYN
+	binary.BigEndian.PutUint16(tcp[14:16], 65535)
+	copy(tcp[20:], []byte{1, 1, 2, 4, byte(mss >> 8), byte(mss), 0, 0})
+	binary.BigEndian.PutUint16(tcp[16:18], ipv4TransportChecksum(6, source[:], destination[:], tcp))
+	binary.BigEndian.PutUint16(packet[10:12], internetChecksum(packet[:ipHeaderLen]))
+	return packet
+}
+
+func TestClampTCPMSSLowersSynMSSAndKeepsChecksumValid(t *testing.T) {
+	src, dst := [4]byte{100, 96, 0, 10}, [4]byte{100, 96, 0, 11}
+	packet := clampTCPMSS(buildIPv4TCPSyn(src, dst, 1460), overlayMaxTCPMSS)
+
+	if got := binary.BigEndian.Uint16(packet[20+24 : 20+26]); got != overlayMaxTCPMSS {
+		t.Fatalf("MSS = %d, want %d", got, overlayMaxTCPMSS)
+	}
+	if got := ipv4TransportChecksum(6, packet[12:16], packet[16:20], packet[20:]); got != 0 {
+		t.Fatalf("TCP checksum invalid after clamp: %#04x", got)
+	}
+}
+
+func TestClampTCPMSSLeavesSmallMSSAndNonSynAlone(t *testing.T) {
+	src, dst := [4]byte{100, 96, 0, 10}, [4]byte{100, 96, 0, 11}
+
+	small := buildIPv4TCPSyn(src, dst, 1000)
+	before := append([]byte(nil), small...)
+	if !bytes.Equal(clampTCPMSS(small, overlayMaxTCPMSS), before) {
+		t.Fatal("SYN with MSS below the cap was modified")
+	}
+
+	data := buildIPv4TCPPacket(src, dst, []byte("SSH-2.0-test"))
+	before = append([]byte(nil), data...)
+	if !bytes.Equal(clampTCPMSS(data, overlayMaxTCPMSS), before) {
+		t.Fatal("non-SYN segment was modified")
+	}
+}

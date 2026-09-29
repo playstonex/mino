@@ -995,6 +995,7 @@ func (m *OverlayManager) tunReadLoop() {
 		pktCopy := make([]byte, pktLen)
 		copy(pktCopy, packet)
 		tunReadPool.Put(bufPtr)
+		pktCopy = clampTCPMSS(pktCopy, overlayMaxTCPMSS)
 
 		// Encrypt
 		encrypted, err := m.encryptPacket(pktCopy, peerCipher)
@@ -1117,6 +1118,9 @@ func (m *OverlayManager) handleInboundPacket(peerID string, payload []byte) {
 	if cfg != nil && cfg.Mode == "hybrid" {
 		decrypted = rewriteHybridOverlayDestination(decrypted, localIP)
 	}
+	// Clamp the peer's SYN/SYN-ACK MSS so our stack never sends segments too
+	// large for the relay path, even when the peer runs an older build.
+	decrypted = clampTCPMSS(decrypted, overlayMaxTCPMSS)
 
 	// Write to TUN fd
 	if err := m.writeToTUN(decrypted); err != nil {
