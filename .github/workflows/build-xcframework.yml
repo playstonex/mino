@@ -53,7 +53,10 @@ jobs:
           # "go mod tidy failed / missing module declaration").
           go install golang.org/x/mobile/cmd/gomobile@6873502
           go install golang.org/x/mobile/cmd/gobind@6873502
-          gomobile init
+          # No `gomobile init` here: it re-installs gobind@latest (which
+          # now needs Go >= 1.26, we run 1.25) and would overwrite the
+          # pinned gobind above. Apple targets need no NDK/init step;
+          # build_xframework.sh creates its own GOMOBILE cache dir.
 
       - name: Build XCFramework
         run: |
