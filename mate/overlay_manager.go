@@ -255,6 +255,10 @@ type OverlayManager struct {
 	peerSessionIDs map[string]string
 	offeredPeers   map[string]bool
 	failedPeers    map[string]bool
+	// p2pAttemptGen is bumped for every locally initiated offer (direct or
+	// relay-only) so a timeout goroutine can tell whether the attempt it is
+	// watching is still the current one before tearing anything down.
+	p2pAttemptGen map[string]uint64
 
 	// Per-peer P2P failure tracking
 	peerFailCount     map[string]int       // peerID -> consecutive P2P failure count
@@ -320,6 +324,7 @@ func NewOverlayManager() *OverlayManager {
 		pendingPings:      make(map[string]pingRecord),
 		offeredPeers:      make(map[string]bool),
 		failedPeers:       make(map[string]bool),
+		p2pAttemptGen:     make(map[string]uint64),
 		peerFailCount:     make(map[string]int),
 		peerCooldownUntil: make(map[string]time.Time),
 		routes:            make(map[string]string),
@@ -556,6 +561,7 @@ func (m *OverlayManager) cleanupPartialStart() {
 	m.peerSessionIDs = make(map[string]string)
 	m.offeredPeers = make(map[string]bool)
 	m.failedPeers = make(map[string]bool)
+	m.p2pAttemptGen = make(map[string]uint64)
 	m.peerFailCount = make(map[string]int)
 	m.peerCooldownUntil = make(map[string]time.Time)
 	m.relayEndpoint = ""
@@ -1617,13 +1623,50 @@ func (m *OverlayManager) pollRemoteSignaling() {
 			}
 
 			shouldInject := false
+
+			// The remote peer restarted its offer (e.g. its direct attempt
+			// timed out and it re-offered relay-only over TURN). We are the
+			// answerer for that negotiation, so the new offer supersedes our
+			// in-progress or already-dead session. Skipping it left the
+			// remote waiting for an answer that never came while both sides
+			// sat in "connecting" indefinitely.
+			if !weOffered && latestSDP.sdpType == "offer" &&
+				(currentState == peerStateSDPReceived || currentState == peerStateConnected) {
+				newUfrag := extractUfrag(latestSDP.candidate.Type)
+				if newUfrag != "" && newUfrag != m.peerUfrags[peer.ID] {
+					m.logf("[Overlay-Go] Peer %s restarted its offer (new ufrag), superseding %s session",
+						truncateID(peer.ID), currentState)
+					delete(m.peerSessionIDs, peer.ID)
+					delete(m.peerUfrags, peer.ID)
+					delete(m.failedPeers, peer.ID)
+					m.peerStates[peer.ID] = peerStateIdle
+					currentState = peerStateIdle
+				}
+			}
+
 			if currentState == peerStateConnected {
 				m.logf("[Overlay-Go] Skipping new %s from %s, already connected", latestSDP.sdpType, truncateID(peer.ID))
 			} else if currentState == peerStateSDPReceived && weOffered && latestSDP.sdpType == "answer" {
 				shouldInject = true
 			} else if currentState == peerStateSDPReceived && weOffered && latestSDP.sdpType == "offer" {
-				m.logf("[Overlay-Go] Skipping glare offer from %s while waiting for answer", truncateID(peer.ID))
-				m.markSeen(peer.ID, latestSDP.sigKey)
+				// Glare: both devices offered at once. Resolve it
+				// deterministically so exactly one negotiation survives:
+				// the device with the larger ID is "polite" and yields,
+				// dropping its own offer and answering the remote's. The
+				// other keeps waiting for that answer. Previously both sides
+				// skipped each other's offer and both attempts died.
+				if m.deviceID != "" && m.deviceID > peer.ID {
+					m.logf("[Overlay-Go] Glare with %s: yielding own offer and answering theirs", truncateID(peer.ID))
+					delete(m.offeredPeers, peer.ID)
+					delete(m.peerSessionIDs, peer.ID)
+					delete(m.peerUfrags, peer.ID)
+					m.p2pAttemptGen[peer.ID]++ // cancel our own offer's timers
+					m.peerStates[peer.ID] = peerStateIdle
+					shouldInject = true
+				} else {
+					m.logf("[Overlay-Go] Glare with %s: keeping own offer, waiting for their answer", truncateID(peer.ID))
+					m.markSeen(peer.ID, latestSDP.sigKey)
+				}
 			} else if currentState == peerStateSDPReceived {
 				m.logf("[Overlay-Go] Skipping new %s from %s, SDP already in progress (%s)",
 					latestSDP.sdpType, truncateID(peer.ID), currentState)
@@ -1733,6 +1776,12 @@ func (m *OverlayManager) pollRemoteSignaling() {
 			if sid := extractSessionID(item.payload); sid != "" {
 				m.peerSessionIDs[item.peerID] = sid
 			}
+			// We just answered a remote offer: bound this negotiation too,
+			// otherwise nothing ever moves the answerer out of sdpReceived.
+			if item.sdpType == "offer" {
+				m.p2pAttemptGen[item.peerID]++
+				go m.abandonP2PIfNoDataChannel(item.peerID, m.p2pAttemptGen[item.peerID], p2pAnswerAttemptTimeout)
+			}
 		}
 		m.mu.Unlock()
 	}
@@ -1774,9 +1823,14 @@ func (m *OverlayManager) initiateP2POffers() {
 // ForceP2POffer resets all P2P failure state for a peer and initiates
 // a fresh WebRTC offer. Used when the user explicitly requests a
 // direct connection upgrade from relay.
-func (m *OverlayManager) ForceP2POffer(peerID string) error {
+//
+// The returned status tells the caller what actually happened:
+// forceP2PStarted (a new offer was sent), forceP2PAlreadyDirect (a direct
+// DataChannel is already open) or forceP2PInProgress (a negotiation is
+// already running). The latter two leave the existing session untouched.
+func (m *OverlayManager) ForceP2POffer(peerID string) (string, error) {
 	if !m.running.Load() {
-		return fmt.Errorf("overlay not running")
+		return "", fmt.Errorf("overlay not running")
 	}
 
 	m.mu.Lock()
@@ -1789,7 +1843,24 @@ func (m *OverlayManager) ForceP2POffer(peerID string) error {
 	}
 	if !peerExists {
 		m.mu.Unlock()
-		return fmt.Errorf("peer %s not found", truncateID(peerID))
+		return "", fmt.Errorf("peer %s not found", truncateID(peerID))
+	}
+
+	// One direct connection per peer pair. If a DataChannel is already open,
+	// or a negotiation (ours or the remote's) is in flight, do not start a
+	// second one: a fresh offer would tear down the working/pending session
+	// and, if the remote is tapping at the same time, collide with its offer.
+	// Every in-flight negotiation is time-bounded (see scheduleRelayFallback /
+	// abandonP2PIfNoDataChannel), so a stuck one clears itself.
+	switch state := m.peerStates[peerID]; {
+	case state == peerStateConnected && globalOverlayTransport.HasPacketConn(peerID):
+		m.mu.Unlock()
+		m.logf("[Overlay-Go] ForceP2POffer: %s already has a direct DataChannel, ignoring", truncateID(peerID))
+		return forceP2PAlreadyDirect, nil
+	case state == peerStateSDPReceived:
+		m.mu.Unlock()
+		m.logf("[Overlay-Go] ForceP2POffer: negotiation with %s already in progress, ignoring", truncateID(peerID))
+		return forceP2PInProgress, nil
 	}
 
 	delete(m.peerFailCount, peerID)
@@ -1805,38 +1876,101 @@ func (m *OverlayManager) ForceP2POffer(peerID string) error {
 
 	if err := StartP2POffer(peerID); err != nil {
 		m.logf("[Overlay-Go] ForceP2POffer failed for %s: %v", truncateID(peerID), err)
-		return err
+		return "", err
 	}
 
 	m.mu.Lock()
 	m.offeredPeers[peerID] = true
 	m.peerStates[peerID] = peerStateSDPReceived
+	m.p2pAttemptGen[peerID]++
+	gen := m.p2pAttemptGen[peerID]
 	m.mu.Unlock()
 
 	m.logf("[Overlay-Go] ForceP2POffer: P2P offer sent for peer %s", truncateID(peerID))
 
 	// Schedule a relay-only fallback attempt if the initial P2P offer fails.
-	// After 15 seconds, if the peer is still not connected, retry with
-	// ICETransportPolicy=relay to bypass firewall/NAT issues via TURN.
-	go m.scheduleRelayFallback(peerID)
+	// After p2pDirectAttemptTimeout, if the peer is still not connected, retry
+	// with ICETransportPolicy=relay to bypass firewall/NAT issues via TURN.
+	go m.scheduleRelayFallback(peerID, gen)
 
-	return nil
+	return forceP2PStarted, nil
+}
+
+// ForceP2POffer outcome statuses, reported to Swift in the result JSON.
+const (
+	forceP2PStarted       = "started"
+	forceP2PAlreadyDirect = "already_direct"
+	forceP2PInProgress    = "in_progress"
+)
+
+// Timings for the P2P upgrade state machine. Variables (not constants) so
+// tests can shrink them.
+var (
+	// How long a direct offer may run before the TURN relay-only retry.
+	p2pDirectAttemptTimeout = 15 * time.Second
+	// Extra time granted when the PeerConnection is already "connected" but
+	// the DataChannel has not opened yet. SCTP/DataChannel open normally
+	// follows ICE+DTLS by ~1-2s; tearing the PC down in that window (observed
+	// in the field: "connected" then "timed out (state=connected, no
+	// DataChannel)" in the same second) throws away a working connection.
+	p2pDataChannelGrace = 5 * time.Second
+	// How long the relay-only retry may run before the upgrade is abandoned.
+	// Without this bound a relay-only offer whose answer never arrives leaves
+	// the peer in sdpReceived forever, which the UI shows as "connecting"
+	// until the tunnel is restarted.
+	p2pRelayOnlyAttemptTimeout = 20 * time.Second
+	// Bound for the ANSWERER side of a negotiation. The answerer starts no
+	// timers of its own, so if the offerer gives up (or its answer is lost)
+	// the answerer would otherwise sit in sdpReceived ("connecting") forever.
+	// Longer than the offerer's direct+relay-only window so a live relay-only
+	// re-offer from the offerer supersedes it first.
+	p2pAnswerAttemptTimeout = 40 * time.Second
+)
+
+// sleepOrCancel waits d, returning false if the overlay was cancelled first.
+func (m *OverlayManager) sleepOrCancel(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-m.cancelCh:
+		return false
+	}
+}
+
+// attemptCurrent reports whether gen is still the latest local offer attempt
+// for peerID (a newer ForceP2POffer supersedes an older timeout goroutine).
+func (m *OverlayManager) attemptCurrent(peerID string, gen uint64) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.p2pAttemptGen[peerID] == gen
+}
+
+// waitDataChannelGrace gives a PeerConnection that already reached
+// "connected" a short extra window for its DataChannel to open. Returns true
+// if the DataChannel is open by the end.
+func (m *OverlayManager) waitDataChannelGrace(peerID string) bool {
+	deadline := time.Now().Add(p2pDataChannelGrace)
+	for time.Now().Before(deadline) {
+		if globalOverlayTransport.HasPacketConn(peerID) {
+			return true
+		}
+		if !m.sleepOrCancel(100 * time.Millisecond) {
+			return false
+		}
+	}
+	return globalOverlayTransport.HasPacketConn(peerID)
 }
 
 // scheduleRelayFallback waits for the initial P2P attempt to either succeed
 // or fail, then retries with relay-only ICE transport policy if needed.
-func (m *OverlayManager) scheduleRelayFallback(peerID string) {
-	// Wait 15 seconds for the initial attempt to complete
-	timer := time.NewTimer(15 * time.Second)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C:
-	case <-m.cancelCh:
+func (m *OverlayManager) scheduleRelayFallback(peerID string, gen uint64) {
+	if !m.sleepOrCancel(p2pDirectAttemptTimeout) {
 		return
 	}
 
-	if !m.running.Load() {
+	if !m.running.Load() || !m.attemptCurrent(peerID, gen) {
 		return
 	}
 
@@ -1853,6 +1987,17 @@ func (m *OverlayManager) scheduleRelayFallback(peerID string) {
 	m.mu.RLock()
 	state := m.peerStates[peerID]
 	m.mu.RUnlock()
+
+	// Connected but DataChannel not open yet: it usually opens within a
+	// second or two. Give it a grace window before discarding the PC.
+	if state == peerStateConnected {
+		if m.waitDataChannelGrace(peerID) {
+			return
+		}
+		if !m.running.Load() || !m.attemptCurrent(peerID, gen) {
+			return
+		}
+	}
 
 	m.logf("[Overlay-Go] P2P direct attempt timed out for %s (state=%s, no DataChannel), retrying with TURN relay-only",
 		truncateID(peerID), state)
@@ -1874,9 +2019,56 @@ func (m *OverlayManager) scheduleRelayFallback(peerID string) {
 	m.mu.Lock()
 	m.offeredPeers[peerID] = true
 	m.peerStates[peerID] = peerStateSDPReceived
+	m.p2pAttemptGen[peerID]++
+	gen = m.p2pAttemptGen[peerID]
 	m.mu.Unlock()
 
 	m.logf("[Overlay-Go] ForceP2POffer: relay-only P2P offer sent for peer %s (TURN fallback)", truncateID(peerID))
+
+	m.abandonP2PIfNoDataChannel(peerID, gen, p2pRelayOnlyAttemptTimeout)
+}
+
+// abandonP2PIfNoDataChannel is the final bound on a local P2P upgrade: if
+// the relay-only attempt has not produced an open DataChannel within
+// p2pRelayOnlyAttemptTimeout, drop the PeerConnection and mark the peer
+// failed. Traffic already rides the VPS relay in the meantime; this only
+// stops the peer from sitting in sdpReceived ("connecting") forever and lets
+// a later ForceP2POffer or a fresh remote offer start clean.
+func (m *OverlayManager) abandonP2PIfNoDataChannel(peerID string, gen uint64, timeout time.Duration) {
+	if !m.sleepOrCancel(timeout) {
+		return
+	}
+	if !m.running.Load() || !m.attemptCurrent(peerID, gen) {
+		return
+	}
+	if globalOverlayTransport.HasPacketConn(peerID) {
+		return
+	}
+	m.mu.RLock()
+	state := m.peerStates[peerID]
+	m.mu.RUnlock()
+	if state == peerStateConnected {
+		if m.waitDataChannelGrace(peerID) {
+			return
+		}
+		if !m.running.Load() || !m.attemptCurrent(peerID, gen) {
+			return
+		}
+	}
+
+	m.mu.Lock()
+	if m.p2pAttemptGen[peerID] != gen {
+		m.mu.Unlock()
+		return
+	}
+	m.peerStates[peerID] = peerStateFailed
+	m.failedPeers[peerID] = true
+	delete(m.offeredPeers, peerID)
+	m.mu.Unlock()
+
+	RemoveP2PPeer(peerID)
+	m.logf("[Overlay-Go] P2P upgrade for %s abandoned (state=%s, no DataChannel within %v); traffic stays on VPS relay",
+		truncateID(peerID), state, timeout)
 }
 
 // ---------------------------------------------------------------------------

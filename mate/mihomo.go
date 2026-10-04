@@ -309,15 +309,26 @@ func PingAllOverlayPeers() string {
 
 // ForceP2POffer forces a P2P direct connection attempt for a specific peer.
 // Resets any cooldown/failure state and initiates a fresh WebRTC offer.
+//
+// Result JSON: {"peerID", "status", "error"}. status is "started",
+// "already_direct" or "in_progress" on success and "" on error. Encoded with
+// json.Marshal so an error message containing quotes stays valid JSON.
 func ForceP2POffer(peerID string) string {
+	type result struct {
+		PeerID string `json:"peerID"`
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	r := result{PeerID: peerID}
 	if globalOverlayManager == nil || !globalOverlayManager.running.Load() {
-		return fmt.Sprintf(`{"peerID":"%s","error":"overlay not running"}`, peerID)
+		r.Error = "overlay not running"
+	} else if status, err := globalOverlayManager.ForceP2POffer(peerID); err != nil {
+		r.Error = err.Error()
+	} else {
+		r.Status = status
 	}
-	err := globalOverlayManager.ForceP2POffer(peerID)
-	if err != nil {
-		return fmt.Sprintf(`{"peerID":"%s","error":"%s"}`, peerID, err.Error())
-	}
-	return fmt.Sprintf(`{"peerID":"%s","error":""}`, peerID)
+	out, _ := json.Marshal(r)
+	return string(out)
 }
 
 // func Version() string {

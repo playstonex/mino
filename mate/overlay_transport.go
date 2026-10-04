@@ -367,7 +367,22 @@ func (m *overlayTransportManager) ensureRelay() (*p2p.RelayClient, error) {
 	m.relayClient = relayClient
 	m.relayFailCount = 0
 	m.relayLastFail = time.Time{}
+	// RegisterPeer() calls that landed while the dial ran unlocked saw
+	// relayClient == nil and only recorded the peer in m.peers, so the
+	// snapshot above missed them. Without this re-sync every SendToPeer for
+	// such a peer fails with "relay: unknown peer" for the life of the
+	// client -- the relay path silently drops all traffic (SSH SYNs never
+	// leave the device). AddPeer is idempotent, so re-adding all is safe.
+	latePeers := make([]string, 0, len(m.peers))
+	for peerID := range m.peers {
+		latePeers = append(latePeers, peerID)
+	}
 	m.mu.Unlock()
+	for _, peerID := range latePeers {
+		if err := relayClient.AddPeer(peerID); err != nil {
+			m.logf("[OverlayTransport] relay AddPeer %s failed: %v", peerID, err)
+		}
+	}
 	return relayClient, nil
 }
 
