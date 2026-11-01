@@ -55,6 +55,7 @@ const (
 	OpenConnect
 	P2P
 	ZeroTier
+	EasyTier
 	GostRelay
 )
 
@@ -243,6 +244,8 @@ func (at AdapterType) String() string {
 		return "P2P"
 	case ZeroTier:
 		return "ZeroTier"
+	case EasyTier:
+		return "EasyTier"
 	case GostRelay:
 		return "GostRelay"
 	case Relay:

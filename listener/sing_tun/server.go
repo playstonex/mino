@@ -104,17 +104,17 @@ func clampTCPWindowBytes(v int) int {
 // Network Extension budget the extra two processors' goroutines and buffers are
 // memory the extension cannot spare and peak throughput it does not need, so iOS
 // is pinned to 1 (upstream MetaCubeX made the same trade for memory-constrained
-// hosts in 92433dba). 0 means "use sing-tun's default", which every other
-// platform keeps.
-func processorsPerChannelForGOOS(goos string) int {
+// hosts in 92433dba). Other platforms use the configured value; 0 means
+// "use sing-tun's default".
+func processorsPerChannelForGOOS(goos string, configured int) int {
 	if goos == "ios" {
 		return 1
 	}
-	return 0
+	return configured
 }
 
-func processorsPerChannel() int {
-	return processorsPerChannelForGOOS(runtime.GOOS)
+func processorsPerChannel(configured int) int {
+	return processorsPerChannelForGOOS(runtime.GOOS, configured)
 }
 
 type Listener struct {
@@ -352,6 +352,12 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 		excludeMACAddress = append(excludeMACAddress, addr)
 	}
 
+	switch options.DNSMode {
+	case "", tun.DNSModeDisabled, tun.DNSModeNative, tun.DNSModeHijack:
+	default:
+		return nil, fmt.Errorf("invalid dns-mode: %s", options.DNSMode)
+	}
+
 	var dnsAdds []netip.AddrPort
 
 	for _, d := range options.DNSHijack {
@@ -468,6 +474,7 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 		GSO:                                   options.GSO,
 		Inet4Address:                          options.Inet4Address,
 		Inet6Address:                          options.Inet6Address,
+		DNSMode:                               options.DNSMode,
 		AutoRoute:                             options.AutoRoute,
 		IPRoute2TableIndex:                    tableIndex,
 		IPRoute2RuleIndex:                     ruleIndex,
@@ -496,7 +503,7 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 		InterfaceMonitor:                      defaultInterfaceMonitor,
 		EXP_RecvMsgX:                          options.RecvMsgX,
 		EXP_SendMsgX:                          options.SendMsgX,
-		EXP_ProcessorsPerChannel:              processorsPerChannel(),
+		EXP_ProcessorsPerChannel:              processorsPerChannel(options.ProcessorsPerChannel),
 	}
 
 	if options.AutoRedirect {
@@ -582,6 +589,7 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 		Logger:                 log.SingLogger,
 		ForwarderBindInterface: forwarderBindInterface,
 		InterfaceFinder:        interfaceFinder,
+		TCPCongestionControl:   options.CongestionController,
 		EnforceBindInterface:   EnforceBindInterface,
 		PacketInterceptor:      C.GetTunPacketInterceptor(),
 		TCPWindowBytes:         clampTCPWindowBytes(options.TCPWindowBytes),
@@ -629,8 +637,8 @@ func New(options LC.Tun, tunnel C.Tunnel, creator C.TunListenOutterCreator, addi
 	if options.FileDescriptor != 0 {
 		tunName = fmt.Sprintf("%s(fd=%d)", tunName, options.FileDescriptor)
 	}
-	l.addrStr = fmt.Sprintf("%s(%s,%s), mtu: %d, auto route: %v, auto redir: %v, ip stack: %s",
-		tunName, tunOptions.Inet4Address, tunOptions.Inet6Address, tunMTU, options.AutoRoute, options.AutoRedirect, options.Stack)
+	l.addrStr = fmt.Sprintf("%s(%s,%s), mtu: %d, auto route: %v, auto redir: %v, ip stack: %s, dns mode: %s",
+		tunName, tunOptions.Inet4Address, tunOptions.Inet6Address, tunMTU, options.AutoRoute, options.AutoRedirect, options.Stack, options.DNSMode)
 	return
 }
 

@@ -79,47 +79,10 @@ func DialContext(ctx context.Context, network, address string, options ...Option
 func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.AddrPort, options ...Option) (net.PacketConn, error) {
 	opt := applyOptions(options...)
 
-	lc := &net.ListenConfig{}
-	if opt.addrReuse {
-		addrReuseToListenConfig(lc)
+	lc, address, err := listenConfig(network, address, rAddrPort, opt)
+	if err != nil {
+		return nil, err
 	}
-	if DefaultSocketHook != nil { // ignore interfaceName, routingMark when DefaultSocketHook not null (in CMFA)
-		fmt.Fprintf(os.Stderr, "[dialer] ListenPacket: hooking %s %s (hook is set)\n", network, address)
-
-		// Try the normal path first (socket() + DefaultSocketHook for protect).
-		socketHookToListenConfig(lc)
-	} else {
-		if opt.interfaceName == "" {
-			opt.interfaceName = DefaultInterface.Load()
-		}
-		if opt.interfaceName == "" {
-			if finder := DefaultInterfaceFinder.Load(); finder != nil {
-				opt.interfaceName = finder.FindInterfaceName(rAddrPort.Addr().Unmap())
-			}
-		}
-		if rAddrPort.Addr().Unmap().IsLoopback() {
-			// avoid "The requested address is not valid in its context."
-			opt.interfaceName = ""
-		}
-		if opt.interfaceName != "" {
-			bind := bindIfaceToListenConfig
-			if opt.fallbackBind {
-				bind = fallbackBindIfaceToListenConfig
-			}
-			addr, err := bind(opt.interfaceName, lc, network, address, rAddrPort)
-			if err != nil {
-				return nil, err
-			}
-			address = addr
-		}
-		if opt.routingMark == 0 {
-			opt.routingMark = int(DefaultRoutingMark.Load())
-		}
-		if opt.routingMark != 0 {
-			bindMarkToListenConfig(opt.routingMark, lc, network, address)
-		}
-	}
-
 	conn, err := lc.ListenPacket(ctx, network, address)
 	if err != nil && DefaultSocketHook != nil {
 		// Fallback: if socket() was blocked (Android 16 seccomp), try
@@ -135,6 +98,60 @@ func ListenPacket(ctx context.Context, network, address string, rAddrPort netip.
 		}
 	}
 	return conn, err
+}
+
+// Listen creates a TCP listener with the same socket policy as ListenPacket.
+func Listen(ctx context.Context, network, address string, options ...Option) (net.Listener, error) {
+	lc, address, err := listenConfig(network, address, netip.AddrPort{}, applyOptions(options...))
+	if err != nil {
+		return nil, err
+	}
+	return lc.Listen(ctx, network, address)
+}
+
+func listenConfig(network, address string, rAddrPort netip.AddrPort, opt option) (*net.ListenConfig, string, error) {
+	lc := &net.ListenConfig{}
+	if opt.addrReuse {
+		addrReuseToListenConfig(lc)
+	}
+	if DefaultSocketHook != nil { // ignore interfaceName, routingMark when DefaultSocketHook not null (in CMFA)
+		fmt.Fprintf(os.Stderr, "[dialer] listenConfig: hooking %s %s (hook is set)\n", network, address)
+
+		// Try the normal path first (socket() + DefaultSocketHook for protect).
+		socketHookToListenConfig(lc)
+	} else {
+		if opt.interfaceName == "" {
+			opt.interfaceName = DefaultInterface.Load()
+		}
+		if opt.interfaceName == "" {
+			if finder := DefaultInterfaceFinder.Load(); finder != nil {
+				opt.interfaceName = finder.FindInterfaceName(rAddrPort.Addr().Unmap())
+			}
+		}
+		if rAddrPort.Addr().Unmap().IsLoopback() || listenAddressIsLoopback(address) {
+			// avoid "The requested address is not valid in its context."
+			opt.interfaceName = ""
+		}
+		if opt.interfaceName != "" {
+			bind := bindIfaceToListenConfig
+			if opt.fallbackBind {
+				bind = fallbackBindIfaceToListenConfig
+			}
+			addr, err := bind(opt.interfaceName, lc, network, address, rAddrPort)
+			if err != nil {
+				return nil, "", err
+			}
+			address = addr
+		}
+		if opt.routingMark == 0 {
+			opt.routingMark = int(DefaultRoutingMark.Load())
+		}
+		if opt.routingMark != 0 {
+			bindMarkToListenConfig(opt.routingMark, lc, network, address)
+		}
+	}
+
+	return lc, address, nil
 }
 
 func dialContext(ctx context.Context, network string, destination netip.Addr, port string, opt option) (net.Conn, error) {
@@ -431,6 +448,15 @@ func parseAddr(ctx context.Context, network, address string, preferResolver reso
 		}
 	}
 	return ips, port, nil
+}
+
+func listenAddressIsLoopback(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.Unmap().IsLoopback()
 }
 
 type Dialer struct {
