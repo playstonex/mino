@@ -641,6 +641,56 @@ func (m *OverlayManager) Stop() error {
 }
 
 // ---------------------------------------------------------------------------
+// Token refresh
+// ---------------------------------------------------------------------------
+
+// UpdateToken swaps in a freshly minted overlay access token while the overlay
+// stays connected. The Go core holds the access token given at Start() for the
+// whole session and uses it on every control-plane request (peer sync, relay
+// list) and when dialing the relay; once it expires those requests begin to
+// 401. Swift renews the token out of band (OverlayBootstrapService) and pushes
+// the new value here so the session never has to be torn down and rebuilt just
+// to carry a current token.
+//
+// A blank token is ignored (nothing to apply), and when the token is unchanged
+// this is a no-op so repeated pushes stay cheap. Returns an error only when the
+// overlay is not running so the caller can fall back to a full restart.
+func (m *OverlayManager) UpdateToken(accessToken string) error {
+	if !m.running.Load() {
+		return fmt.Errorf("overlay not running")
+	}
+	if accessToken == "" {
+		return fmt.Errorf("empty access token")
+	}
+
+	m.mu.Lock()
+	if m.config == nil {
+		m.mu.Unlock()
+		return fmt.Errorf("overlay not configured")
+	}
+	if m.config.AccessToken == accessToken {
+		m.mu.Unlock()
+		return nil
+	}
+	m.config.AccessToken = accessToken
+	relayEndpoint := m.relayEndpoint
+	deviceID := m.deviceID
+	m.mu.Unlock()
+
+	// Re-point the relay transport at the new token. Configure() only tears
+	// down and redials the relay client when something actually changed, so an
+	// unchanged relay endpoint with a new token refreshes just the credential.
+	if relayEndpoint != "" && deviceID != "" {
+		if err := globalOverlayTransport.Configure(relayEndpoint, accessToken, deviceID); err != nil {
+			m.logf("[Overlay-Go] UpdateToken: relay reconfigure failed: %v", err)
+		}
+	}
+
+	m.logf("[Overlay-Go] Access token updated in place")
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // Snapshot
 // ---------------------------------------------------------------------------
 

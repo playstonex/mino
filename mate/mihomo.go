@@ -268,6 +268,23 @@ func StopOverlay() error {
 	return globalOverlayManager.Stop()
 }
 
+// MateUpdateOverlayToken swaps in a renewed overlay access token without
+// tearing down the running overlay session. Swift renews the token out of band
+// (OverlayBootstrapService) and pushes it here so the Go core stops issuing
+// expired-token (401) control-plane and relay requests mid-session.
+//
+// Returns an empty string on success, or an error message when the overlay is
+// not running / not configured so Swift can fall back to a full restart.
+func UpdateOverlayToken(accessToken string) string {
+	if globalOverlayManager == nil {
+		return "overlay not running"
+	}
+	if err := globalOverlayManager.UpdateToken(accessToken); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // MateGetOverlaySnapshotJSON returns the current overlay state for UI display.
 // The returned JSON matches Swift's OverlaySnapshot schema exactly.
 //
